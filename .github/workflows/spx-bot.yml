@@ -1,0 +1,47 @@
+name: SPX Bot
+
+on:
+  schedule:
+    - cron: "0 13 * * 1-5"
+    - cron: "0 14 * * 1-5"
+    - cron: "50 16 * * 1-5"
+    - cron: "50 17 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      test_minutes:
+        description: "تشغيل تجريبي بالدقائق (اتركه فارغاً للتشغيل العادي)"
+        required: false
+        default: ""
+
+concurrency:
+  group: spx-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - uses: actions/cache@v4
+        with:
+          path: state.json
+          key: spx-state-${{ github.run_id }}
+          restore-keys: spx-state-
+
+      - name: Run bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATA_SOURCE: ${{ vars.DATA_SOURCE || 'yahoo' }}
+          CI_WINDOWS: "1"
+          TEST_MINUTES: ${{ github.event.inputs.test_minutes }}
+        run: python spx_bot.py
