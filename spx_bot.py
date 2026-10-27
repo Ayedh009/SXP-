@@ -2,7 +2,7 @@
 """
 بوت تيليجرام لتداول SPX500 (بيانات Yahoo Finance أو Capital.com)
 - تقرير ساعي أثناء الجلسة الأمريكية
-- تنبيهات آخر 30 و 15 دقيقة مع توقع سعر الإغلاق
+- تنبيهات آخر 30 و15 دقيقة مع توقع سعر الإغلاق
 - إشارات لحظية: صفقات Call/Put، أوردربلوك، فجوات FVG، اختراق خط الكنترول، الأهداف
 - أوامر يدوية: /report  /status  /help
 
@@ -31,6 +31,9 @@ import requests
 # ───────────────────────── الإعدادات ─────────────────────────
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
+# توقيت شارتك المحلي: يُعرض بجانب توقيت نيويورك لتسهيل مطابقة الشموع فقط
+LOCAL = ZoneInfo(os.getenv("LOCAL_TZ", "America/Chicago"))
+LOCAL_NAME = os.getenv("LOCAL_TZ_NAME", "شيكاغو")
 
 # مصدر البيانات: yahoo (الافتراضي، بدون حساب) أو capital
 DATA_SOURCE = os.getenv("DATA_SOURCE", "yahoo").lower()
@@ -327,6 +330,37 @@ def f(x):
     return f"{x:,.2f}"
 
 
+def hm(dt, tz=NY):
+    """HH:MM بتوقيت tz (الافتراضي نيويورك)"""
+    return dt.astimezone(tz).strftime("%H:%M")
+
+
+def fmt_delay(sec):
+    sec = max(sec, 0)
+    return f"{sec:.0f} ث" if sec < 90 else f"{sec / 60:.1f} د"
+
+
+def stamp(ns, t, label="آخر شمعة", full=True):
+    """يوضّح على أي شمعة بُنيت الرسالة ومتى أُرسلت وعمر البيانات.
+    t = وقت فتح الشمعة (نيويورك). full=False يعرض سطر الشمعة فقط."""
+    end = t + timedelta(minutes=5)
+    sent = datetime.now(NY)
+    is_closed = end <= sent
+    line = (f"🕯 {label}: {hm(t)} → {hm(end)} نيويورك "
+            f"({LOCAL_NAME} {hm(t, LOCAL)}) — {'مغلقة' if is_closed else 'جارية'}")
+    if not full:
+        return line
+    second = f"🕒 أُرسلت {sent.strftime('%H:%M:%S')}"
+    if is_closed:
+        second += f" (بعد إغلاقها بـ {fmt_delay((sent - end).total_seconds())})"
+    age = getattr(ns, "data_age", None)
+    if age is not None:
+        # عمر البيانات = الدقائق منذ فتح أحدث شمعة وصلت من المصدر.
+        # حتى 5 دقائق = بيانات لحظية؛ نحو 15 فأكثر = تأخر حقيقي في المصدر.
+        second += f" | عمر البيانات: {age:.1f} د " + ("✅" if age <= 6 else "⚠️ متأخرة")
+    return line + "\n" + second
+
+
 # ───────────────────────── البوت ─────────────────────────
 class Bot:
     def __init__(self):
@@ -420,6 +454,8 @@ class Bot:
         ns = SimpleNamespace()
         ns.now, ns.c5, ns.closed, ns.today = now, c5, closed, today
         ns.price = c5[-1].c
+        ns.last_t = c5[-1].t
+        ns.data_age = max((now - c5[-1].t).total_seconds() / 60.0, 0.0)
         ns.atr5 = atr(closed[-60:]) or 0.5
         ns.atr1h = atr(hv.h1[-30:]) if hv.h1 else ns.atr5 * 3
         ns.vix, ns.vix_chg = hv.vix, hv.vix_chg
@@ -508,6 +544,7 @@ class Bot:
             f"قمة اليوم: {f(ns.day_high)} (تبعد {f(ns.day_high - ns.price)} نقطة)",
             f"قاع اليوم: {f(ns.day_low)} (يبعد {f(ns.price - ns.day_low)} نقطة)",
         ]
+        L += ["", stamp(ns, ns.last_t, "آخر شمعة في البيانات")]
         return "\n".join(L)
 
     # ---- تنبيهات آخر 30 / 15 دقيقة ----
@@ -544,6 +581,8 @@ class Bot:
             f"أقرب سيولة: قمة اليوم {f(ns.day_high)} | قاع اليوم {f(ns.day_low)}",
             f"توصية عقد الربع ساعة الأخيرة: {rec}",
             "",
+            stamp(ns, ns.last_t, "آخر شمعة في البيانات"),
+            "",
             "⚠️ هذا تقدير إحصائي مبني على الزخم والسيولة وليس توقعاً مضموناً.",
         ]
         return "\n".join(L)
@@ -565,7 +604,8 @@ class Bot:
             if z.kind.startswith("FVG") and z.t >= closed[-2].t and z.id not in self.fvg_seen:
                 self.fvg_seen.add(z.id)
                 tg_send(f"📦 تكوّنت {z.name}\nالنطاق: {f(z.lo)} – {f(z.hi)}\n"
-                        f"الفريم: 5 دقائق | السعر الآن: {f(ns.price)}")
+                        f"الفريم: 5 دقائق | السعر الآن: {f(ns.price)}\n"
+                        + stamp(ns, z.t, "شمعة تكوّن الفجوة"))
 
         # 2) اقتراب السعر من أوردربلوك
         for z in ns.zones:
@@ -576,7 +616,8 @@ class Bot:
                 self.touched.add(z.id)
                 side = "شراء 🟢" if z.bullish else "بيع 🔴"
                 tg_send(f"🧱 السعر عند منطقة {z.name} ({side})\n"
-                        f"النطاق: {f(z.lo)} – {f(z.hi)}\nالسعر الآن: {f(ns.price)}")
+                        f"النطاق: {f(z.lo)} – {f(z.hi)}\nالسعر الآن: {f(ns.price)}\n"
+                        + stamp(ns, ns.last_t, "آخر شمعة في البيانات"))
 
         # 3) اختراق خط الكنترول (إغلاق شمعة)
         idx = len(ns.today)
@@ -591,7 +632,8 @@ class Bot:
                 self.cross_seen.add(key)
                 tg_send(("⚡ إغلاق شمعة فوق خط الكنترول — انحياز صاعد 🟢\n" if up else
                          "⚡ إغلاق شمعة تحت خط الكنترول — انحياز هابط 🔴\n")
-                        + f"الكنترول: {f(cs_)} | الإغلاق: {f(tc[-1].c)}")
+                        + f"الكنترول: {f(cs_)} | الإغلاق: {f(tc[-1].c)}\n"
+                        + stamp(ns, tc[-1].t, "شمعة الاختراق"))
 
         # 4) متابعة الصفقات المفتوحة
         self.track_trades(ns)
@@ -640,7 +682,11 @@ class Bot:
             f"السبب: ارتداد من {z.name} ({f(z.lo)} – {f(z.hi)}) مع إغلاق شمعة مؤكد\n"
             f"سعر الدخول: {f(entry)}\nوقف الخسارة: {f(sl)}\n"
             f"الهدف الأول TP1: {f(tp1)}\nالهدف الثاني TP2: {f(tp2)}\n"
-            f"{htf_txt}\n\n⚠️ إشارة آلية للمساعدة وليست نصيحة مالية؛ التزم بإدارة المخاطر."
+            f"{htf_txt}\n\n"
+            f"{stamp(ns, k.t, 'شمعة التأكيد')}\n"
+            f"🧱 {z.name} على شمعة: {hm(z.t)} نيويورك\n"
+            f"💱 السعر الآن: {f(ns.price)} ({ns.price - entry:+.2f} عن سعر الدخول)\n\n"
+            "⚠️ إشارة آلية للمساعدة وليست نصيحة مالية؛ التزم بإدارة المخاطر."
         )
 
     def track_trades(self, ns):
@@ -657,21 +703,25 @@ class Bot:
                 if hit_sl and not tr["tp1_hit"]:
                     tr["done"] = True
                     tg_send(f"🛑 ضُرب وقف الخسارة لصفقة {tr['side']}\n"
-                            f"الدخول: {f(tr['entry'])} | الوقف: {f(tr['sl'])}")
+                            f"الدخول: {f(tr['entry'])} | الوقف: {f(tr['sl'])}\n"
+                            + stamp(ns, c.t, "عند شمعة", full=False))
                     break
                 if hit1 and not tr["tp1_hit"]:
                     tr["tp1_hit"] = True
                     tg_send(f"🎯 تحقق الهدف الأول لصفقة {tr['side']} ✅\n"
-                            f"TP1: {f(tr['tp1'])} — يُنصح بنقل الوقف إلى سعر الدخول.")
+                            f"TP1: {f(tr['tp1'])} — يُنصح بنقل الوقف إلى سعر الدخول.\n"
+                            + stamp(ns, c.t, "عند شمعة", full=False))
                     tr["sl"] = tr["entry"]
                 if hit2:
                     tr["done"] = True
                     tg_send(f"🎯🎯 تحقق الهدف الثاني لصفقة {tr['side']} ✅\n"
-                            f"TP2: {f(tr['tp2'])} — الصفقة مكتملة.")
+                            f"TP2: {f(tr['tp2'])} — الصفقة مكتملة.\n"
+                            + stamp(ns, c.t, "عند شمعة", full=False))
                     break
                 if tr["tp1_hit"] and (c.l <= tr["sl"] if long else c.h >= tr["sl"]):
                     tr["done"] = True
-                    tg_send(f"↩️ أُغلقت صفقة {tr['side']} عند الدخول بعد تحقق الهدف الأول.")
+                    tg_send(f"↩️ أُغلقت صفقة {tr['side']} عند الدخول بعد تحقق الهدف الأول.\n"
+                            + stamp(ns, c.t, "عند شمعة", full=False))
                     break
 
     # ---- الدورة الرئيسية ----
@@ -743,45 +793,14 @@ class Bot:
                 time.sleep(5)
 
 
-def setup_mode():
-    """وضع الإعداد: يتحقق من التوكن ويطبع رقم المحادثة (Chat ID) في سجل التشغيل."""
-    base = f"https://api.telegram.org/bot{TG_TOKEN}"
-    try:
-        me = requests.get(base + "/getMe", timeout=15).json()
-    except Exception as e:
-        log.error("تعذر الاتصال بتيليجرام: %s", e)
-        return
-    if not me.get("ok"):
-        log.error("❌ التوكن غير صحيح (%s). انسخه من BotFather ← /mybots ← API Token "
-                  "والصقه في السر TELEGRAM_TOKEN بدون مسافات.", me.get("description"))
-        return
-    log.info("✅ التوكن صحيح — البوت: @%s", me["result"].get("username"))
-    ups = requests.get(base + "/getUpdates", timeout=15).json().get("result", [])
-    found = {}
-    for u in ups:
-        for key in ("message", "edited_message", "my_chat_member", "channel_post"):
-            chat = (u.get(key) or {}).get("chat")
-            if chat:
-                found[chat["id"]] = chat.get("first_name") or chat.get("title") or chat.get("username") or ""
-    if not found:
-        log.warning("⚠️ لا توجد رسائل. أرسل /start لبوتك من حسابك ثم أعد تشغيل الـ workflow.")
-        return
-    for cid, name in found.items():
-        log.info("🆔 CHAT_ID = %s   (%s)", cid, name)
-    log.info("انسخ الرقم أعلاه وضعه في السر TELEGRAM_CHAT_ID ثم شغّل الـ workflow مرة أخرى.")
-
-
 def main():
-    need = {"TELEGRAM_TOKEN": TG_TOKEN}
+    need = {"TELEGRAM_TOKEN": TG_TOKEN, "TELEGRAM_CHAT_ID": TG_CHAT}
     if DATA_SOURCE == "capital":
         need.update({"CAPITAL_API_KEY": API_KEY, "CAPITAL_IDENTIFIER": API_ID,
                      "CAPITAL_PASSWORD": API_PW})
     missing = [k for k, v in need.items() if not v]
     if missing:
         raise SystemExit("متغيرات بيئية ناقصة: " + ", ".join(missing))
-    if not TG_CHAT:            # لم يُضبط Chat ID بعد → وضع الإعداد
-        setup_mode()
-        return
     now = datetime.now(NY)
     test = os.getenv("TEST_MINUTES")
     if test:                                   # تشغيل تجريبي يدوي
