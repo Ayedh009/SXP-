@@ -743,14 +743,45 @@ class Bot:
                 time.sleep(5)
 
 
+def setup_mode():
+    """وضع الإعداد: يتحقق من التوكن ويطبع رقم المحادثة (Chat ID) في سجل التشغيل."""
+    base = f"https://api.telegram.org/bot{TG_TOKEN}"
+    try:
+        me = requests.get(base + "/getMe", timeout=15).json()
+    except Exception as e:
+        log.error("تعذر الاتصال بتيليجرام: %s", e)
+        return
+    if not me.get("ok"):
+        log.error("❌ التوكن غير صحيح (%s). انسخه من BotFather ← /mybots ← API Token "
+                  "والصقه في السر TELEGRAM_TOKEN بدون مسافات.", me.get("description"))
+        return
+    log.info("✅ التوكن صحيح — البوت: @%s", me["result"].get("username"))
+    ups = requests.get(base + "/getUpdates", timeout=15).json().get("result", [])
+    found = {}
+    for u in ups:
+        for key in ("message", "edited_message", "my_chat_member", "channel_post"):
+            chat = (u.get(key) or {}).get("chat")
+            if chat:
+                found[chat["id"]] = chat.get("first_name") or chat.get("title") or chat.get("username") or ""
+    if not found:
+        log.warning("⚠️ لا توجد رسائل. أرسل /start لبوتك من حسابك ثم أعد تشغيل الـ workflow.")
+        return
+    for cid, name in found.items():
+        log.info("🆔 CHAT_ID = %s   (%s)", cid, name)
+    log.info("انسخ الرقم أعلاه وضعه في السر TELEGRAM_CHAT_ID ثم شغّل الـ workflow مرة أخرى.")
+
+
 def main():
-    need = {"TELEGRAM_TOKEN": TG_TOKEN, "TELEGRAM_CHAT_ID": TG_CHAT}
+    need = {"TELEGRAM_TOKEN": TG_TOKEN}
     if DATA_SOURCE == "capital":
         need.update({"CAPITAL_API_KEY": API_KEY, "CAPITAL_IDENTIFIER": API_ID,
                      "CAPITAL_PASSWORD": API_PW})
     missing = [k for k, v in need.items() if not v]
     if missing:
         raise SystemExit("متغيرات بيئية ناقصة: " + ", ".join(missing))
+    if not TG_CHAT:            # لم يُضبط Chat ID بعد → وضع الإعداد
+        setup_mode()
+        return
     now = datetime.now(NY)
     test = os.getenv("TEST_MINUTES")
     if test:                                   # تشغيل تجريبي يدوي
