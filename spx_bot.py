@@ -2,12 +2,12 @@
 """
 بوت تيليجرام لتداول SPX500 (بيانات Yahoo Finance أو Capital.com)
 - تقرير ساعي أثناء الجلسة الأمريكية
-- تنبيهات آخر 30 و15 دقيقة مع توقع سعر الإغلاق
+- تنبيهات آخر 30 و 15 دقيقة مع توقع سعر الإغلاق
 - إشارات لحظية: صفقات Call/Put، أوردربلوك، فجوات FVG، اختراق خط الكنترول، الأهداف
 - أوامر يدوية: /report  /status  /help
 
 المتغيرات البيئية المطلوبة:
-  TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
+  TELEGRAM_TOKEN, TELEGRAM_CHAT_ID  (يقبل عدة معرّفات مفصولة بفاصلة)
 مصدر البيانات الافتراضي: Yahoo Finance (^GSPC و ^VIX) بدون أي حساب.
 لاستخدام Capital.com بدلاً منه: DATA_SOURCE=capital مع
   CAPITAL_API_KEY, CAPITAL_IDENTIFIER (الإيميل), CAPITAL_PASSWORD
@@ -64,6 +64,8 @@ API_ID = os.getenv("CAPITAL_IDENTIFIER", "")
 API_PW = os.getenv("CAPITAL_PASSWORD", "")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
+# يمكن وضع أكثر من معرّف مفصولين بفاصلة: 123456789,-1001234567890
+TG_CHATS = [c.strip() for c in TG_CHAT.split(",") if c.strip()]
 DEMO = os.getenv("CAPITAL_DEMO", "1") != "0"
 BASE = ("https://demo-api-capital.backend-capital.com" if DEMO
         else "https://api-capital.backend-capital.com")
@@ -189,15 +191,20 @@ class Yahoo:
 
 # ───────────────────────── تيليجرام ─────────────────────────
 def tg_send(text, chat=None):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-            data={"chat_id": chat or TG_CHAT, "text": text,
-                  "disable_web_page_preview": True},
-            timeout=15,
-        )
-    except Exception:
-        log.exception("فشل إرسال رسالة تيليجرام")
+    """chat=None: إرسال لكل المعرّفات في TELEGRAM_CHAT_ID. أو معرّف واحد محدد."""
+    targets = [str(chat)] if chat else TG_CHATS
+    for cid in targets:
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                data={"chat_id": cid, "text": text,
+                      "disable_web_page_preview": True},
+                timeout=15,
+            )
+            if not r.ok:
+                log.warning("تيليجرام رفض الإرسال إلى %s: %s", cid, r.text[:200])
+        except Exception:
+            log.exception("فشل إرسال رسالة تيليجرام إلى %s", cid)
 
 
 # ───────────────────────── أدوات حسابية ─────────────────────────
@@ -775,7 +782,7 @@ class Bot:
                     m = u.get("message") or {}
                     chat = str(m.get("chat", {}).get("id", ""))
                     text = (m.get("text") or "").strip().lower()
-                    if chat != str(TG_CHAT):
+                    if chat not in TG_CHATS:
                         continue
                     if text.startswith("/report"):
                         with self.lock:
