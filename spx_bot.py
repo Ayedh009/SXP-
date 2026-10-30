@@ -4,6 +4,7 @@
 - تقرير ساعي أثناء الجلسة الأمريكية
 - تنبيهات آخر 30 و 15 دقيقة مع توقع سعر الإغلاق
 - إشارات لحظية: صفقات Call/Put، أوردربلوك، فجوات FVG، اختراق خط الكنترول، الأهداف
+- إشارة Rejection Block (RB) صعودية أو هبوطية عند إغلاق شمعة التأكيد
 - أوامر يدوية: /report  /status  /help
 
 المتغيرات البيئية المطلوبة:
@@ -58,6 +59,12 @@ LOOP_SECONDS = 45          # دورة المراقبة
 HEAVY_REFRESH = 600        # تحديث البيانات الثقيلة كل 10 دقائق
 MAX_TRADES_PER_DAY = 6
 SIGNAL_COOLDOWN_MIN = 30   # أقل فاصل بين إشارتين في نفس الاتجاه
+
+# ── إعدادات Rejection Block (عدّل الأرقام هنا لو أردت إشارات أكثر أو أقل) ──
+RB_WICK_RATIO = 0.5        # الذيل الطويل >= 50% من مدى الشمعة
+RB_BODY_RATIO = 0.35       # الجسم <= 35% من مدى الشمعة
+RB_MIN_RANGE_ATR = 0.8     # مدى شمعة الرفض >= 0.8 من ATR (لتجاهل الشموع الصغيرة)
+RB_SWING_LOOKBACK = 10     # الرفض عند قاع/قمة محلية آخر 10 شموع
 
 API_KEY = os.getenv("CAPITAL_API_KEY", "")
 API_ID = os.getenv("CAPITAL_IDENTIFIER", "")
@@ -321,6 +328,29 @@ def find_fvgs(cs, a):
     return out[-6:]
 
 
+def rb_side(cs, i, a):
+    """هل الشمعة رقم i شمعة رفض (Rejection)؟
+    يرجع "UP" (ذيل سفلي طويل عند قاع محلي) أو "DOWN" (ذيل علوي طويل عند قمة محلية)
+    أو None. المنطقة تكون جسم الشمعة (من الفتح إلى الإغلاق)."""
+    if i < RB_SWING_LOOKBACK:
+        return None
+    k = cs[i]
+    rng = k.h - k.l
+    if rng <= 0 or rng < RB_MIN_RANGE_ATR * a:
+        return None
+    top, bot = max(k.o, k.c), min(k.o, k.c)
+    body = top - bot
+    if body > RB_BODY_RATIO * rng:
+        return None
+    lower, upper = bot - k.l, k.h - top
+    prev = cs[i - RB_SWING_LOOKBACK:i]
+    if lower >= RB_WICK_RATIO * rng and lower > upper and k.l <= min(c.l for c in prev):
+        return "UP"
+    if upper >= RB_WICK_RATIO * rng and upper > lower and k.h >= max(c.h for c in prev):
+        return "DOWN"
+    return None
+
+
 def vix_reading(v):
     if v is None:
         return "غير متاح"
@@ -380,6 +410,7 @@ class Bot:
         self.touched = set()
         self.fvg_seen = set()
         self.cross_seen = set()
+        self.rb_seen = set()
         self.last_signal = {}
         self.trades = []
         self.day = None
@@ -395,6 +426,7 @@ class Bot:
                 "signaled": list(self.signaled), "touched": list(self.touched),
                 "fvg_seen": list(self.fvg_seen),
                 "cross_seen": [t.isoformat() for t in self.cross_seen],
+                "rb_seen": list(self.rb_seen),
                 "last_signal": {k: v.isoformat() for k, v in self.last_signal.items()},
                 "trades": [dict(tr, **{"from": tr["from"].isoformat()}) for tr in self.trades],
             }
@@ -417,6 +449,7 @@ class Bot:
             self.signaled, self.touched = set(d["signaled"]), set(d["touched"])
             self.fvg_seen = set(d["fvg_seen"])
             self.cross_seen = {datetime.fromisoformat(t) for t in d["cross_seen"]}
+            self.rb_seen = set(d.get("rb_seen", []))
             self.last_signal = {k: datetime.fromisoformat(v) for k, v in d["last_signal"].items()}
             self.trades = [dict(tr, **{"from": datetime.fromisoformat(tr["from"])})
                            for tr in d["trades"]]
@@ -601,6 +634,7 @@ class Bot:
             self.day, self.count = now.date(), 0
             self.signaled.clear(); self.touched.clear()
             self.fvg_seen.clear(); self.cross_seen.clear()
+            self.rb_seen.clear()
             self.trades.clear(); self.fired.clear(); self.last_signal.clear()
 
         closed = ns.closed
@@ -642,6 +676,9 @@ class Bot:
                         + f"الكنترول: {f(cs_)} | الإغلاق: {f(tc[-1].c)}\n"
                         + stamp(ns, tc[-1].t, "شمعة الاختراق"))
 
+        # 3.5) Rejection Block (شمعة رفض + شمعة تأكيد)
+        self.check_rb(ns)
+
         # 4) متابعة الصفقات المفتوحة
         self.track_trades(ns)
 
@@ -658,6 +695,60 @@ class Bot:
             if (not z.bullish) and k.h >= z.lo and k.c < k.o and k.c < mid:
                 self.open_trade("PUT", z, k, ns)
                 break
+
+    def check_rb(self, ns):
+        """إشارة Rejection Block: شمعة رفض (ذيل طويل عند قاع/قمة محلية)
+        ثم شمعة تأكيد تغلق خارج جسمها. المنطقة = جسم شمعة الرفض."""
+        cs = ns.closed
+        n = len(cs)
+        for j in range(max(n - 3, RB_SWING_LOOKBACK + 1), n):
+            conf, rej = cs[j], cs[j - 1]
+            if conf.t.date() != ns.now.date() or not (OPEN <= conf.t.time() < CLOSE):
+                continue
+            side = rb_side(cs, j - 1, ns.atr5)
+            if not side:
+                continue
+            top, bot = max(rej.o, rej.c), min(rej.o, rej.c)
+            if side == "UP":
+                ok = conf.c > conf.o and conf.c > top
+            else:
+                ok = conf.c < conf.o and conf.c < bot
+            key = f"RB-{side}-{rej.t.isoformat()}"
+            if not ok or key in self.rb_seen:
+                continue
+            self.rb_seen.add(key)
+
+            rng = rej.h - rej.l
+            if side == "UP":
+                wick_pct = (bot - rej.l) / rng * 100
+                title = "🔲 Rejection Block صعودي (RB ↑) 🟢"
+                extreme = f"قاع الذيل (مكان الرفض): {f(rej.l)}"
+                role = "تعمل المنطقة كدعم"
+                inval = f"إغلاق شمعة تحت {f(rej.l)} يُبطلها"
+                htf = ns.bias1h
+            else:
+                wick_pct = (rej.h - top) / rng * 100
+                title = "🔲 Rejection Block هبوطي (RB ↓) 🔴"
+                extreme = f"قمة الذيل (مكان الرفض): {f(rej.h)}"
+                role = "تعمل المنطقة كمقاومة"
+                inval = f"إغلاق شمعة فوق {f(rej.h)} يُبطلها"
+                htf = -ns.bias1h
+            htf_txt = ("متوافق مع الفريم الكبير ✅" if htf > 0 else
+                       "مخالف للفريم الكبير ⚠️ (ارتداد)" if htf < 0 else
+                       "الفريم الكبير محايد")
+            tg_send(
+                f"{title}\n━━━━━━━━━━━━━━\n"
+                f"المنطقة (جسم شمعة الرفض): {f(bot)} – {f(top)}\n"
+                f"{extreme}\n"
+                f"طول الذيل: {wick_pct:.0f}% من الشمعة\n"
+                f"إغلاق شمعة التأكيد: {f(conf.c)}\n"
+                f"{role} | {inval}\n"
+                f"{htf_txt}\n"
+                f"السعر الآن: {f(ns.price)}\n\n"
+                f"{stamp(ns, rej.t, 'شمعة الرفض', full=False)}\n"
+                f"{stamp(ns, conf.t, 'شمعة التأكيد')}\n\n"
+                "⚠️ إشارة آلية للمساعدة وليست نصيحة مالية؛ التزم بإدارة المخاطر."
+            )
 
     def open_trade(self, side, z, k, ns):
         last = self.last_signal.get(side)
