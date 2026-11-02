@@ -1,0 +1,2 @@
+date,open_time_ny,close_time_ny,side,kind,score,entry,stop,tp1,tp2,exit,result,r_multiple
+2026-11-02,12:15,12:20,CALL,RB,1,7621.88,7618.37,7625.39,7628.90,7618.37,SL,-1.00
