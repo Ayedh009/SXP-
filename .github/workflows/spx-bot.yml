@@ -17,6 +17,9 @@ concurrency:
   group: spx-bot
   cancel-in-progress: false
 
+permissions:
+  contents: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -31,7 +34,7 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         with:
           path: state.json
           key: spx-state-${{ github.run_id }}
@@ -41,7 +44,38 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          DATA_SOURCE: ${{ vars.DATA_SOURCE || 'yahoo' }}
           CI_WINDOWS: "1"
           TEST_MINUTES: ${{ github.event.inputs.test_minutes }}
         run: python spx_bot.py
+
+      - uses: actions/cache/save@v4
+        if: always() && hashFiles('state.json') != ''
+        with:
+          path: state.json
+          key: spx-state-${{ github.run_id }}
+
+      - name: Save stats (trade and prediction logs)
+        if: always()
+        run: |
+          if [ -d stats ] && [ -n "$(git status --porcelain stats)" ]; then
+            git config user.name "spx-bot"
+            git config user.email "spx-bot@users.noreply.github.com"
+            git add stats
+            git commit -m "stats $(date -u +%F)"
+            git pull --rebase origin "${{ github.ref_name }}" || true
+            git push || true
+          fi
+
+      - name: Failure alert
+        if: failure()
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          IFS=',' read -ra IDS <<< "$TELEGRAM_CHAT_ID"
+          for id in "${IDS[@]}"; do
+            id=$(echo "$id" | xargs)
+            curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
+              --data-urlencode "chat_id=${id}" \
+              --data-urlencode "text=⚠️ توقف بوت SPX بسبب خطأ في GitHub Actions. راجع تبويب Actions في المستودع." > /dev/null
+          done
