@@ -1,22 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-بوت تيليجرام لتداول SPX500 (بيانات Yahoo Finance أو Capital.com)
+بوت تيليجرام لتداول SPX500 (بيانات Yahoo Finance المجانية)
 - تقرير ساعي أثناء الجلسة الأمريكية
 - تنبيهات آخر 30 و 15 دقيقة مع توقع سعر الإغلاق
-- إشارات لحظية: صفقات Call/Put، أوردربلوك، فجوات FVG، اختراق خط الكنترول، الأهداف
-- إشارة Rejection Block (RB) صعودية أو هبوطية عند إغلاق شمعة التأكيد
-- أوامر يدوية: /report  /status  /help
+- إشارات: Call/Put من الأوردربلوك والفجوات، وإشارة Rejection Block (RB)
+- درجة لكل إشارة (ضعيفة / متوسطة / قوية) من تقاطع RB و OB و FVG وخط الكنترول
+- سحب السيولة قبل RB، تنبيه إعادة اختبار الصندوق، رسالة إلغاء، تحذير انعكاس
+- سجل صفقات + سجل توقعات الإغلاق (مجلد stats) + أمر /stats + ملخص نهاية اليوم
+- تنبيه عند حدوث عطل بدل الصمت، ودمج التنبيهات المتقاربة في رسالة واحدة
+- أوامر يدوية: /report  /status  /stats  /help
 
 المتغيرات البيئية المطلوبة:
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID  (يقبل عدة معرّفات مفصولة بفاصلة)
-مصدر البيانات الافتراضي: Yahoo Finance (^GSPC و ^VIX) بدون أي حساب.
-لاستخدام Capital.com بدلاً منه: DATA_SOURCE=capital مع
-  CAPITAL_API_KEY, CAPITAL_IDENTIFIER (الإيميل), CAPITAL_PASSWORD
-  واختياري CAPITAL_DEMO=1 (تجريبي، الافتراضي) أو 0 (حقيقي)
 المتطلبات: pip install requests
 """
 
 import os
+import csv
 import json
 import time
 import math
@@ -36,15 +36,11 @@ UTC = timezone.utc
 LOCAL = ZoneInfo(os.getenv("LOCAL_TZ", "America/Chicago"))
 LOCAL_NAME = os.getenv("LOCAL_TZ_NAME", "شيكاغو")
 
-# مصدر البيانات: yahoo (الافتراضي، بدون حساب) أو capital
-DATA_SOURCE = os.getenv("DATA_SOURCE", "yahoo").lower()
-if DATA_SOURCE == "capital":
-    SPX_EPIC, VIX_EPIC = "US500", "VIX"
-else:
-    SPX_EPIC, VIX_EPIC = "^GSPC", "^VIX"
+SPX_EPIC, VIX_EPIC = "^GSPC", "^VIX"
 
 OPEN = dtime(9, 30)
 CLOSE = dtime(16, 0)
+END_WINDOW = dtime(16, 31)   # آخر وقت يعمل فيه البوت بعد الإغلاق (لملخص نهاية اليوم)
 
 # (ساعة، دقيقة، النوع)
 SCHEDULE = [
@@ -52,30 +48,30 @@ SCHEDULE = [
     (12, 0, "report"), (13, 0, "report"), (14, 0, "report"),
     (15, 0, "report"),
     (15, 30, "close30"), (15, 45, "close15"),
+    (16, 20, "eod"),      # ملخص نهاية اليوم وتسجيل النتائج
 ]
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
+STATS_DIR = os.getenv("STATS_DIR", "stats")
+TRADES_CSV = os.path.join(STATS_DIR, "trades.csv")
+PRED_CSV = os.path.join(STATS_DIR, "close_predictions.csv")
 LOOP_SECONDS = 45          # دورة المراقبة
 HEAVY_REFRESH = 600        # تحديث البيانات الثقيلة كل 10 دقائق
-MAX_TRADES_PER_DAY = 6
-SIGNAL_COOLDOWN_MIN = 30   # أقل فاصل بين إشارتين في نفس الاتجاه
+SIGNAL_COOLDOWN_MIN = 30   # أقل فاصل بين إشارتي أوردربلوك/فجوة في نفس الاتجاه
+ERROR_ALERT_GAP = 1800     # أقل فاصل (ثانية) بين تنبيهي عطل متشابهين
 
 # ── إعدادات Rejection Block (عدّل الأرقام هنا لو أردت إشارات أكثر أو أقل) ──
 RB_WICK_RATIO = 0.5        # الذيل الطويل >= 50% من مدى الشمعة
 RB_BODY_RATIO = 0.35       # الجسم <= 35% من مدى الشمعة
 RB_MIN_RANGE_ATR = 0.8     # مدى شمعة الرفض >= 0.8 من ATR (لتجاهل الشموع الصغيرة)
 RB_SWING_LOOKBACK = 10     # الرفض عند قاع/قمة محلية آخر 10 شموع
+RB_STOP_ATR = 0.25         # الوقف = خلف حافة الصندوق + 0.25 ATR
+RB_MIN_RISK_ATR = 0.5      # أقل مسافة للوقف عن الدخول = 0.5 ATR
 
-API_KEY = os.getenv("CAPITAL_API_KEY", "")
-API_ID = os.getenv("CAPITAL_IDENTIFIER", "")
-API_PW = os.getenv("CAPITAL_PASSWORD", "")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
 # يمكن وضع أكثر من معرّف مفصولين بفاصلة: 123456789,-1001234567890
 TG_CHATS = [c.strip() for c in TG_CHAT.split(",") if c.strip()]
-DEMO = os.getenv("CAPITAL_DEMO", "1") != "0"
-BASE = ("https://demo-api-capital.backend-capital.com" if DEMO
-        else "https://api-capital.backend-capital.com")
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(message)s")
@@ -93,56 +89,8 @@ class Candle:
     v: float
 
 
-def _mid(d):
-    return (d["bid"] + d["ask"]) / 2.0
-
-
-class Capital:
-    def __init__(self):
-        self.headers = {}
-
-    def login(self):
-        r = requests.post(
-            BASE + "/api/v1/session",
-            headers={"X-CAP-API-KEY": API_KEY, "Content-Type": "application/json"},
-            json={"identifier": API_ID, "password": API_PW, "encryptedPassword": False},
-            timeout=15,
-        )
-        r.raise_for_status()
-        self.headers = {
-            "X-SECURITY-TOKEN": r.headers["X-SECURITY-TOKEN"],
-            "CST": r.headers["CST"],
-        }
-        log.info("تم تسجيل الدخول إلى Capital.com")
-
-    def candles(self, epic, resolution, n):
-        for _ in range(2):
-            if not self.headers:
-                self.login()
-            r = requests.get(
-                BASE + "/api/v1/prices/" + epic,
-                headers=self.headers,
-                params={"resolution": resolution, "max": n},
-                timeout=20,
-            )
-            if r.status_code == 401:      # انتهت الجلسة
-                self.headers = {}
-                continue
-            r.raise_for_status()
-            out = []
-            for p in r.json().get("prices", []):
-                t = (datetime.fromisoformat(p["snapshotTimeUTC"])
-                     .replace(tzinfo=UTC).astimezone(NY))
-                out.append(Candle(t, _mid(p["openPrice"]), _mid(p["highPrice"]),
-                                  _mid(p["lowPrice"]), _mid(p["closePrice"]),
-                                  float(p.get("lastTradedVolume") or 0)))
-            out.sort(key=lambda x: x.t)
-            return out
-        raise RuntimeError("فشل جلب البيانات من Capital.com")
-
-
 class Yahoo:
-    """مصدر Yahoo Finance المجاني (بدون حساب). نفس واجهة Capital.candles."""
+    """مصدر Yahoo Finance المجاني (بدون حساب)."""
     UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                         "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
     MAP = {"MINUTE_5": ("5m", "5d"), "HOUR": ("60m", "1mo"),
@@ -204,7 +152,7 @@ def tg_send(text, chat=None):
         try:
             r = requests.post(
                 f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                data={"chat_id": cid, "text": text,
+                data={"chat_id": cid, "text": text[:4000],
                       "disable_web_page_preview": True},
                 timeout=15,
             )
@@ -236,7 +184,7 @@ def ema(vals, n):
 
 
 def htf_bias(cs):
-    """+1 صاعد، -1 هابط، 0 محايد (فلتر استدلالي فقط)"""
+    """+1 صاعد، -1 هابط، 0 محايد (للمعلومة فقط، لا يمنع أي إشارة)"""
     closes = [c.c for c in cs]
     if len(closes) < 30:
         return 0
@@ -351,6 +299,49 @@ def rb_side(cs, i, a):
     return None
 
 
+def sweep_info(cs, i, prev_high, prev_low, side):
+    """هل سبق شمعة الرفض سحب سيولة؟ = ذيل الشمعة كسر قاعاً/قمة سابقة
+    (آخر 10 شموع أو قاع/قمة اليوم السابق) وجسمها أُغلق عائداً داخلها.
+    يرجع (اسم المستوى، قيمته) أو None."""
+    k = cs[i]
+    prev = cs[i - RB_SWING_LOOKBACK:i]
+    top, bot = max(k.o, k.c), min(k.o, k.c)
+    if side == "UP":
+        levels = [("قاع سابق", min(c.l for c in prev))]
+        if prev_low is not None:
+            levels.append(("قاع اليوم السابق", prev_low))
+        for name, lv in levels:
+            if k.l < lv < bot:
+                return name, lv
+    else:
+        levels = [("قمة سابقة", max(c.h for c in prev))]
+        if prev_high is not None:
+            levels.append(("قمة اليوم السابق", prev_high))
+        for name, lv in levels:
+            if k.h > lv > top:
+                return name, lv
+    return None
+
+
+def overlaps(lo1, hi1, lo2, hi2, pad=0.0):
+    return lo1 <= hi2 + pad and hi1 >= lo2 - pad
+
+
+def strength(score):
+    if score >= 3:
+        return "قوية 🔥"
+    if score == 2:
+        return "متوسطة 🟡"
+    return "ضعيفة ⚪"
+
+
+def flags_text(fl):
+    def m(ok):
+        return "✅" if ok else "▫️"
+    return (f"RB {m(fl['RB'])} | OB {m(fl['OB'])} | FVG {m(fl['FVG'])} | "
+            f"الكنترول {m(fl['CTRL'])}")
+
+
 def vix_reading(v):
     if v is None:
         return "غير متاح"
@@ -392,16 +383,62 @@ def stamp(ns, t, label="آخر شمعة", full=True):
         second += f" (بعد إغلاقها بـ {fmt_delay((sent - end).total_seconds())})"
     age = getattr(ns, "data_age", None)
     if age is not None:
-        # عمر البيانات = الدقائق منذ فتح أحدث شمعة وصلت من المصدر.
-        # حتى 5 دقائق = بيانات لحظية؛ نحو 15 فأكثر = تأخر حقيقي في المصدر.
         second += f" | عمر البيانات: {age:.1f} د " + ("✅" if age <= 6 else "⚠️ متأخرة")
     return line + "\n" + second
+
+
+# ───────────────────────── السجلات (CSV) ─────────────────────────
+TRADE_HEADER = ["date", "open_time_ny", "close_time_ny", "side", "kind", "score",
+                "entry", "stop", "tp1", "tp2", "exit", "result", "r_multiple"]
+PRED_HEADER = ["date", "alert", "alert_time_ny", "price", "predicted", "side",
+               "final_close", "result"]
+
+
+def csv_append(path, header, row):
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        new = not os.path.exists(path)
+        with open(path, "a", newline="", encoding="utf-8") as fh:
+            w = csv.writer(fh)
+            if new:
+                w.writerow(header)
+            w.writerow(row)
+    except Exception:
+        log.exception("تعذر الكتابة في السجل %s", path)
+
+
+def csv_read(path):
+    try:
+        with open(path, encoding="utf-8", newline="") as fh:
+            return list(csv.DictReader(fh))
+    except FileNotFoundError:
+        return []
+    except Exception:
+        log.exception("تعذر قراءة السجل %s", path)
+        return []
+
+
+def _enc(d):
+    return {k: (v.isoformat() if isinstance(v, datetime) else v) for k, v in d.items()}
+
+
+def _dec(d, keys):
+    out = dict(d)
+    for k in keys:
+        if out.get(k):
+            out[k] = datetime.fromisoformat(out[k])
+    return out
+
+
+RESULT_AR = {"TP2": "حقق الهدف الثاني ✅", "TP1_BE": "حقق الهدف الأول ثم خرج عند الدخول ✅",
+             "SL": "ضُرب الوقف ❌", "EOD": "أُغلقت بنهاية الجلسة ⏹"}
+WIN_RESULTS = ("TP2", "TP1_BE")
 
 
 # ───────────────────────── البوت ─────────────────────────
 class Bot:
     def __init__(self):
-        self.api = Capital() if DATA_SOURCE == "capital" else Yahoo()
+        self.api = Yahoo()
         self.lock = threading.Lock()
         self.heavy = None
         self.heavy_t = 0
@@ -411,8 +448,12 @@ class Bot:
         self.fvg_seen = set()
         self.cross_seen = set()
         self.rb_seen = set()
+        self.rb_boxes = []
+        self.preds = []
         self.last_signal = {}
         self.trades = []
+        self.outbox = []
+        self.err_sent = {}
         self.day = None
         self.count = 0
         self.load_state()
@@ -427,8 +468,10 @@ class Bot:
                 "fvg_seen": list(self.fvg_seen),
                 "cross_seen": [t.isoformat() for t in self.cross_seen],
                 "rb_seen": list(self.rb_seen),
+                "rb_boxes": [_enc(b) for b in self.rb_boxes],
+                "preds": [_enc(p) for p in self.preds],
                 "last_signal": {k: v.isoformat() for k, v in self.last_signal.items()},
-                "trades": [dict(tr, **{"from": tr["from"].isoformat()}) for tr in self.trades],
+                "trades": [_enc(tr) for tr in self.trades],
             }
             with open(STATE_FILE, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, ensure_ascii=False)
@@ -450,12 +493,45 @@ class Bot:
             self.fvg_seen = set(d["fvg_seen"])
             self.cross_seen = {datetime.fromisoformat(t) for t in d["cross_seen"]}
             self.rb_seen = set(d.get("rb_seen", []))
+            self.rb_boxes = [_dec(b, ["rej_t", "conf_t"]) for b in d.get("rb_boxes", [])]
+            self.preds = [_dec(p, ["t"]) for p in d.get("preds", [])]
             self.last_signal = {k: datetime.fromisoformat(v) for k, v in d["last_signal"].items()}
-            self.trades = [dict(tr, **{"from": datetime.fromisoformat(tr["from"])})
-                           for tr in d["trades"]]
+            self.trades = [_dec(tr, ["from"]) for tr in d["trades"]]
             log.info("تم استرجاع حالة اليوم")
         except Exception:
             log.exception("تعذر استرجاع الحالة")
+
+    # ---- الرسائل: دمج التنبيهات المتقاربة في رسالة واحدة ----
+    def q(self, text):
+        self.outbox.append(text)
+
+    def flush(self):
+        if not self.outbox:
+            return
+        sep = "\n\n──────────────\n\n"
+        chunks, cur = [], ""
+        for m in self.outbox:
+            if cur and len(cur) + len(sep) + len(m) > 3800:
+                chunks.append(cur)
+                cur = m
+            else:
+                cur = cur + sep + m if cur else m
+        if cur:
+            chunks.append(cur)
+        self.outbox = []
+        for c in chunks:
+            tg_send(c)
+
+    def alert_error(self, where, e):
+        key = f"{where}:{type(e).__name__}"
+        if time.time() - self.err_sent.get(key, 0) < ERROR_ALERT_GAP:
+            return
+        self.err_sent[key] = time.time()
+        tg_send(f"⚠️ عطل في البوت — {where}\n"
+                f"النوع: {type(e).__name__}\n"
+                f"التفاصيل: {str(e)[:300]}\n"
+                f"الوقت (نيويورك): {datetime.now(NY).strftime('%Y-%m-%d %H:%M')}\n"
+                "البوت يعيد المحاولة تلقائياً؛ إذا استمر العطل راجع تبويب Actions.")
 
     # ---- بيانات ثقيلة تُحدَّث كل 10 دقائق ----
     def _heavy(self):
@@ -518,9 +594,11 @@ class Bot:
             ns.pivot = (H + L + C) / 3.0
             ns.r1, ns.s1 = 2 * ns.pivot - L, 2 * ns.pivot - H
             ns.prev_close = C
+            ns.prev_high, ns.prev_low = H, L
         else:
             ns.pivot = ns.r1 = ns.s1 = None
             ns.prev_close = today[0].o
+            ns.prev_high = ns.prev_low = None
         ns.change_pct = (ns.price - ns.prev_close) / ns.prev_close * 100
 
         ctrl, vwap = control_series(today)
@@ -605,11 +683,11 @@ class Bot:
             direction = "عرضي ⚪"
         diff = pred - ns.price
         if diff > 0.15 * ns.atr5:
-            rec = "CALL 🟢"
+            rec, side = "CALL 🟢", "CALL"
         elif diff < -0.15 * ns.atr5:
-            rec = "PUT 🔴"
+            rec, side = "PUT 🔴", "PUT"
         else:
-            rec = "لا ميل واضح — يُفضّل الانتظار ⚪"
+            rec, side = "لا ميل واضح — يُفضّل الانتظار ⚪", "NONE"
 
         L = [
             f"⚡ تنبيه الإغلاق — باقي {minutes_left} دقيقة",
@@ -625,7 +703,24 @@ class Bot:
             "",
             "⚠️ هذا تقدير إحصائي مبني على الزخم والسيولة وليس توقعاً مضموناً.",
         ]
-        return "\n".join(L)
+        info = {"alert": str(minutes_left), "t": ns.now, "price": ns.price,
+                "pred": pred, "side": side}
+        return "\n".join(L), info
+
+    # ---- الدرجة: تقاطع RB و OB و FVG وخط الكنترول مع نطاق الإشارة ----
+    def confluence(self, ns, lo, hi, bullish):
+        pad = 0.15 * ns.atr5
+        fl = {"RB": False, "OB": False, "FVG": False, "CTRL": False}
+        for z in ns.zones:
+            if z.bullish == bullish and overlaps(lo, hi, z.lo, z.hi, pad):
+                fl["OB" if z.kind.startswith("OB") else "FVG"] = True
+        for b in self.rb_boxes:
+            if b["active"] and (b["side"] == "UP") == bullish and \
+                    overlaps(lo, hi, b["lo"], b["hi"], pad):
+                fl["RB"] = True
+        if overlaps(lo, hi, ns.control, ns.control, pad + 0.2 * ns.atr5):
+            fl["CTRL"] = True
+        return sum(fl.values()), fl
 
     # ---- تنبيهات لحظية ----
     def check_alerts(self, ns):
@@ -634,56 +729,59 @@ class Bot:
             self.day, self.count = now.date(), 0
             self.signaled.clear(); self.touched.clear()
             self.fvg_seen.clear(); self.cross_seen.clear()
-            self.rb_seen.clear()
+            self.rb_seen.clear(); self.rb_boxes.clear(); self.preds.clear()
             self.trades.clear(); self.fired.clear(); self.last_signal.clear()
+            self.outbox.clear()
 
         closed = ns.closed
         k = closed[-1]
+        live = now.time() < CLOSE
 
-        # 1) فجوة جديدة
-        for z in ns.zones:
-            if z.kind.startswith("FVG") and z.t >= closed[-2].t and z.id not in self.fvg_seen:
-                self.fvg_seen.add(z.id)
-                tg_send(f"📦 تكوّنت {z.name}\nالنطاق: {f(z.lo)} – {f(z.hi)}\n"
-                        f"الفريم: 5 دقائق | السعر الآن: {f(ns.price)}\n"
-                        + stamp(ns, z.t, "شمعة تكوّن الفجوة"))
+        if live:
+            # 1) فجوة جديدة
+            for z in ns.zones:
+                if z.kind.startswith("FVG") and z.t >= closed[-2].t and z.id not in self.fvg_seen:
+                    self.fvg_seen.add(z.id)
+                    self.q(f"📦 تكوّنت {z.name}\nالنطاق: {f(z.lo)} – {f(z.hi)}\n"
+                           f"الفريم: 5 دقائق | السعر الآن: {f(ns.price)}\n"
+                           + stamp(ns, z.t, "شمعة تكوّن الفجوة"))
 
-        # 2) اقتراب السعر من أوردربلوك
-        for z in ns.zones:
-            if not z.kind.startswith("OB") or z.id in self.touched:
-                continue
-            near = ns.price <= z.hi + 0.15 * ns.atr5 and ns.price >= z.lo - 0.15 * ns.atr5
-            if near and z.t < k.t:
-                self.touched.add(z.id)
-                side = "شراء 🟢" if z.bullish else "بيع 🔴"
-                tg_send(f"🧱 السعر عند منطقة {z.name} ({side})\n"
-                        f"النطاق: {f(z.lo)} – {f(z.hi)}\nالسعر الآن: {f(ns.price)}\n"
-                        + stamp(ns, ns.last_t, "آخر شمعة في البيانات"))
+            # 2) اقتراب السعر من أوردربلوك
+            for z in ns.zones:
+                if not z.kind.startswith("OB") or z.id in self.touched:
+                    continue
+                near = ns.price <= z.hi + 0.15 * ns.atr5 and ns.price >= z.lo - 0.15 * ns.atr5
+                if near and z.t < k.t:
+                    self.touched.add(z.id)
+                    side = "شراء 🟢" if z.bullish else "بيع 🔴"
+                    self.q(f"🧱 السعر عند منطقة {z.name} ({side})\n"
+                           f"النطاق: {f(z.lo)} – {f(z.hi)}\nالسعر الآن: {f(ns.price)}\n"
+                           + stamp(ns, ns.last_t, "آخر شمعة في البيانات"))
 
-        # 3) اختراق خط الكنترول (إغلاق شمعة)
-        idx = len(ns.today)
-        tc = [c for c in ns.today if c.t + timedelta(minutes=5) <= now]
-        if len(tc) >= 2 and len(ns.ctrl_series) >= len(tc):
-            cs_ = ns.ctrl_series[len(tc) - 1]
-            ps_ = ns.ctrl_series[len(tc) - 2]
-            up = tc[-2].c <= ps_ and tc[-1].c > cs_
-            dn = tc[-2].c >= ps_ and tc[-1].c < cs_
-            key = tc[-1].t
-            if (up or dn) and key not in self.cross_seen:
-                self.cross_seen.add(key)
-                tg_send(("⚡ إغلاق شمعة فوق خط الكنترول — انحياز صاعد 🟢\n" if up else
-                         "⚡ إغلاق شمعة تحت خط الكنترول — انحياز هابط 🔴\n")
-                        + f"الكنترول: {f(cs_)} | الإغلاق: {f(tc[-1].c)}\n"
-                        + stamp(ns, tc[-1].t, "شمعة الاختراق"))
+            # 3) اختراق خط الكنترول (إغلاق شمعة)
+            tc = [c for c in ns.today if c.t + timedelta(minutes=5) <= now]
+            if len(tc) >= 2 and len(ns.ctrl_series) >= len(tc):
+                cs_ = ns.ctrl_series[len(tc) - 1]
+                ps_ = ns.ctrl_series[len(tc) - 2]
+                up = tc[-2].c <= ps_ and tc[-1].c > cs_
+                dn = tc[-2].c >= ps_ and tc[-1].c < cs_
+                key = tc[-1].t
+                if (up or dn) and key not in self.cross_seen:
+                    self.cross_seen.add(key)
+                    self.q(("⚡ إغلاق شمعة فوق خط الكنترول — انحياز صاعد 🟢\n" if up else
+                            "⚡ إغلاق شمعة تحت خط الكنترول — انحياز هابط 🔴\n")
+                           + f"الكنترول: {f(cs_)} | الإغلاق: {f(tc[-1].c)}\n"
+                           + stamp(ns, tc[-1].t, "شمعة الاختراق"))
 
-        # 3.5) Rejection Block (شمعة رفض + شمعة تأكيد)
-        self.check_rb(ns)
+            # 4) Rejection Block (شمعة رفض + شمعة تأكيد)
+            self.check_rb(ns)
 
-        # 4) متابعة الصفقات المفتوحة
+        # 5) متابعة الصناديق (إعادة اختبار / إلغاء) والصفقات المفتوحة
+        self.rb_lifecycle(ns)
         self.track_trades(ns)
 
-        # 5) صفقة جديدة
-        if now.time() >= CLOSE or self.count >= MAX_TRADES_PER_DAY:
+        # 6) صفقة جديدة من أوردربلوك/فجوة (بدون حد لعدد الصفقات)
+        if not live:
             return
         for z in sorted(ns.zones, key=lambda z: abs(ns.price - (z.lo + z.hi) / 2)):
             if z.id in self.signaled or z.t >= k.t:
@@ -696,59 +794,145 @@ class Bot:
                 self.open_trade("PUT", z, k, ns)
                 break
 
+    # ---- الصفقات ----
+    def add_trade(self, side, kind, score, entry, sl, tp1, tp2, t, ref, box=None):
+        self.count += 1
+        tr = {"side": side, "kind": kind, "score": score, "entry": entry,
+              "sl": sl, "sl0": sl, "risk": abs(entry - sl) or 1.0,
+              "tp1": tp1, "tp2": tp2, "from": t, "ref": ref, "box": box,
+              "tp1_hit": False, "done": False, "warned": False}
+        self.trades.append(tr)
+        return tr
+
+    def close_trade(self, tr, result, exit_price, t):
+        tr["done"] = True
+        tr["result"] = result
+        long = tr["side"] == "CALL"
+        r = (exit_price - tr["entry"]) / tr["risk"] * (1 if long else -1)
+        tr["r"] = round(r, 2)
+        csv_append(TRADES_CSV, TRADE_HEADER, [
+            tr["from"].strftime("%Y-%m-%d"), tr["from"].strftime("%H:%M"),
+            t.astimezone(NY).strftime("%H:%M"), tr["side"], tr["kind"], tr["score"],
+            f"{tr['entry']:.2f}", f"{tr['sl0']:.2f}", f"{tr['tp1']:.2f}",
+            f"{tr['tp2']:.2f}", f"{exit_price:.2f}", result, f"{r:.2f}"])
+
     def check_rb(self, ns):
         """إشارة Rejection Block: شمعة رفض (ذيل طويل عند قاع/قمة محلية)
         ثم شمعة تأكيد تغلق خارج جسمها. المنطقة = جسم شمعة الرفض."""
         cs = ns.closed
         n = len(cs)
+        a = ns.atr5
         for j in range(max(n - 3, RB_SWING_LOOKBACK + 1), n):
             conf, rej = cs[j], cs[j - 1]
             if conf.t.date() != ns.now.date() or not (OPEN <= conf.t.time() < CLOSE):
                 continue
-            side = rb_side(cs, j - 1, ns.atr5)
+            side = rb_side(cs, j - 1, a)
             if not side:
                 continue
             top, bot = max(rej.o, rej.c), min(rej.o, rej.c)
-            if side == "UP":
-                ok = conf.c > conf.o and conf.c > top
-            else:
-                ok = conf.c < conf.o and conf.c < bot
+            up = side == "UP"
+            ok = (conf.c > conf.o and conf.c > top) if up else (conf.c < conf.o and conf.c < bot)
             key = f"RB-{side}-{rej.t.isoformat()}"
             if not ok or key in self.rb_seen:
                 continue
             self.rb_seen.add(key)
 
+            box = {"key": key, "side": side, "lo": bot, "hi": top,
+                   "ext": rej.l if up else rej.h, "rej_t": rej.t, "conf_t": conf.t,
+                   "active": True, "retested": False}
+            self.rb_boxes.append(box)
+
+            sw = sweep_info(cs, j - 1, ns.prev_high, ns.prev_low, side)
+            score, fl = self.confluence(ns, bot, top, up)
+
+            # الوقف خلف حافة الصندوق + ATR، والأهداف 1R و 2R
+            entry = conf.c
+            if up:
+                sl = min(bot - RB_STOP_ATR * a, entry - RB_MIN_RISK_ATR * a)
+            else:
+                sl = max(top + RB_STOP_ATR * a, entry + RB_MIN_RISK_ATR * a)
+            risk = abs(entry - sl)
+            sgn = 1 if up else -1
+            tp1, tp2 = entry + sgn * risk, entry + sgn * 2 * risk
+            tside = "CALL" if up else "PUT"
+            self.add_trade(tside, "RB", score, entry, sl, tp1, tp2, conf.t,
+                           ref=bot if up else top, box=key)
+
             rng = rej.h - rej.l
-            if side == "UP":
+            if up:
                 wick_pct = (bot - rej.l) / rng * 100
                 title = "🔲 Rejection Block صعودي (RB ↑) 🟢"
                 extreme = f"قاع الذيل (مكان الرفض): {f(rej.l)}"
                 role = "تعمل المنطقة كدعم"
-                inval = f"إغلاق شمعة تحت {f(rej.l)} يُبطلها"
+                inval = f"إغلاق شمعة تحت {f(bot)} يُلغيها"
                 htf = ns.bias1h
             else:
                 wick_pct = (rej.h - top) / rng * 100
                 title = "🔲 Rejection Block هبوطي (RB ↓) 🔴"
                 extreme = f"قمة الذيل (مكان الرفض): {f(rej.h)}"
                 role = "تعمل المنطقة كمقاومة"
-                inval = f"إغلاق شمعة فوق {f(rej.h)} يُبطلها"
+                inval = f"إغلاق شمعة فوق {f(top)} يُلغيها"
                 htf = -ns.bias1h
             htf_txt = ("متوافق مع الفريم الكبير ✅" if htf > 0 else
-                       "مخالف للفريم الكبير ⚠️ (ارتداد)" if htf < 0 else
+                       "عكس الفريم الكبير ⚠️ (إشارة ارتداد)" if htf < 0 else
                        "الفريم الكبير محايد")
-            tg_send(
+            sweep_txt = (f"💧 سبقه سحب سيولة ({sw[0]} عند {f(sw[1])})" if sw
+                         else "💧 بدون سحب سيولة")
+            self.q(
                 f"{title}\n━━━━━━━━━━━━━━\n"
+                f"⭐ الدرجة: {strength(score)} ({score}/4)\n"
+                f"{flags_text(fl)}\n"
+                f"{sweep_txt}\n\n"
                 f"المنطقة (جسم شمعة الرفض): {f(bot)} – {f(top)}\n"
                 f"{extreme}\n"
                 f"طول الذيل: {wick_pct:.0f}% من الشمعة\n"
-                f"إغلاق شمعة التأكيد: {f(conf.c)}\n"
-                f"{role} | {inval}\n"
+                f"{role} | {inval}\n\n"
+                f"الاتجاه: {tside}\n"
+                f"سعر الدخول (إغلاق التأكيد): {f(entry)}\n"
+                f"وقف الخسارة: {f(sl)}\n"
+                f"الهدف الأول 1R: {f(tp1)}\n"
+                f"الهدف الثاني 2R: {f(tp2)}\n"
                 f"{htf_txt}\n"
                 f"السعر الآن: {f(ns.price)}\n\n"
                 f"{stamp(ns, rej.t, 'شمعة الرفض', full=False)}\n"
                 f"{stamp(ns, conf.t, 'شمعة التأكيد')}\n\n"
                 "⚠️ إشارة آلية للمساعدة وليست نصيحة مالية؛ التزم بإدارة المخاطر."
             )
+
+    def rb_lifecycle(self, ns):
+        """لكل صندوق RB فعّال: تنبيه إعادة اختبار (مرة واحدة)، أو إلغاء عند
+        إغلاق شمعة خارج الصندوق من الجهة المعاكسة."""
+        for b in self.rb_boxes:
+            if not b["active"]:
+                continue
+            up = b["side"] == "UP"
+            name = "RB ↑" if up else "RB ↓"
+            for c in ns.closed:
+                if c.t <= b["conf_t"] or c.t.date() != ns.now.date():
+                    continue
+                if (up and c.c < b["lo"]) or ((not up) and c.c > b["hi"]):
+                    b["active"] = False
+                    extra = ""
+                    for tr in self.trades:
+                        if tr.get("box") == b["key"] and not tr["done"]:
+                            tr["warned"] = True
+                            extra = (f"\n⚠️ الصفقة ما زالت مفتوحة ووقفها عند {f(tr['sl'])} "
+                                     "— فكّر في إغلاقها يدوياً.")
+                    self.q(f"❌ إلغاء {name}\n"
+                           f"أُغلقت شمعة {'تحت' if up else 'فوق'} الصندوق "
+                           f"({f(b['lo'])} – {f(b['hi'])}) عند {f(c.c)}\n"
+                           "الإشارة لم تعد صالحة." + extra + "\n"
+                           + stamp(ns, c.t, "شمعة الإلغاء"))
+                    break
+                touch = (c.l <= b["hi"]) if up else (c.h >= b["lo"])
+                if touch and not b["retested"]:
+                    b["retested"] = True
+                    self.q(f"🔁 إعادة اختبار {name}\n"
+                           f"السعر عاد لصندوق {f(b['lo'])} – {f(b['hi'])} وأُغلقت الشمعة "
+                           f"{'فوقه' if up else 'تحته'} ({f(c.c)})\n"
+                           f"الصندوق ما زال صالحاً؛ يُلغى بإغلاق "
+                           f"{'تحت ' + f(b['lo']) if up else 'فوق ' + f(b['hi'])}\n"
+                           + stamp(ns, c.t, "شمعة إعادة الاختبار"))
 
     def open_trade(self, side, z, k, ns):
         last = self.last_signal.get(side)
@@ -761,22 +945,25 @@ class Bot:
             sl = min(z.lo, min(c.l for c in recent)) - 0.1 * a
             sl = max(sl, entry - 1.5 * a * 2)
             tp1, tp2 = entry + 1.0 * a * 2, entry + 1.8 * a * 2
+            ref = z.lo
         else:
             sl = max(z.hi, max(c.h for c in recent)) + 0.1 * a
             sl = min(sl, entry + 1.5 * a * 2)
             tp1, tp2 = entry - 1.0 * a * 2, entry - 1.8 * a * 2
+            ref = z.hi
         self.signaled.add(z.id)
         self.last_signal[side] = k.t
-        self.count += 1
-        self.trades.append({"side": side, "entry": entry, "sl": sl, "tp1": tp1,
-                            "tp2": tp2, "from": k.t, "tp1_hit": False, "done": False})
+        score, fl = self.confluence(ns, z.lo, z.hi, z.bullish)
+        self.add_trade(side, z.kind, score, entry, sl, tp1, tp2, k.t, ref=ref)
         htf = ns.bias1h if side == "CALL" else -ns.bias1h
         htf_txt = ("متوافقة مع الفريم الكبير ✅" if htf > 0 else
-                   "مخالفة للفريم الكبير ⚠️ (صفقة ارتداد)" if htf < 0 else
+                   "عكس الفريم الكبير ⚠️ (صفقة ارتداد)" if htf < 0 else
                    "الفريم الكبير محايد")
         emoji = "🟢" if side == "CALL" else "🔴"
-        tg_send(
+        self.q(
             f"🚨 إشارة {side} {emoji}\n━━━━━━━━━━━━━━\n"
+            f"⭐ الدرجة: {strength(score)} ({score}/4)\n"
+            f"{flags_text(fl)}\n\n"
             f"السبب: ارتداد من {z.name} ({f(z.lo)} – {f(z.hi)}) مع إغلاق شمعة مؤكد\n"
             f"سعر الدخول: {f(entry)}\nوقف الخسارة: {f(sl)}\n"
             f"الهدف الأول TP1: {f(tp1)}\nالهدف الثاني TP2: {f(tp2)}\n"
@@ -791,56 +978,197 @@ class Bot:
         for tr in self.trades:
             if tr["done"]:
                 continue
+            long = tr["side"] == "CALL"
+            tag = f"{tr['side']} ({tr.get('kind', '')})"
             for c in ns.c5:
-                if c.t <= tr["from"]:
+                if c.t <= tr["from"] or c.t.time() >= CLOSE:
                     continue
-                long = tr["side"] == "CALL"
+                was_tp1 = tr["tp1_hit"]
                 hit_sl = c.l <= tr["sl"] if long else c.h >= tr["sl"]
                 hit1 = c.h >= tr["tp1"] if long else c.l <= tr["tp1"]
                 hit2 = c.h >= tr["tp2"] if long else c.l <= tr["tp2"]
-                if hit_sl and not tr["tp1_hit"]:
-                    tr["done"] = True
-                    tg_send(f"🛑 ضُرب وقف الخسارة لصفقة {tr['side']}\n"
-                            f"الدخول: {f(tr['entry'])} | الوقف: {f(tr['sl'])}\n"
-                            + stamp(ns, c.t, "عند شمعة", full=False))
+                if hit_sl and not was_tp1:
+                    self.close_trade(tr, "SL", tr["sl"], c.t)
+                    self.q(f"🛑 ضُرب وقف الخسارة لصفقة {tag}\n"
+                           f"الدخول: {f(tr['entry'])} | الوقف: {f(tr['sl'])}\n"
+                           + stamp(ns, c.t, "عند شمعة", full=False))
                     break
-                if hit1 and not tr["tp1_hit"]:
+                if hit1 and not was_tp1:
                     tr["tp1_hit"] = True
-                    tg_send(f"🎯 تحقق الهدف الأول لصفقة {tr['side']} ✅\n"
-                            f"TP1: {f(tr['tp1'])} — يُنصح بنقل الوقف إلى سعر الدخول.\n"
-                            + stamp(ns, c.t, "عند شمعة", full=False))
+                    self.q(f"🎯 تحقق الهدف الأول لصفقة {tag} ✅\n"
+                           f"TP1: {f(tr['tp1'])} — يُنصح بنقل الوقف إلى سعر الدخول.\n"
+                           + stamp(ns, c.t, "عند شمعة", full=False))
                     tr["sl"] = tr["entry"]
                 if hit2:
-                    tr["done"] = True
-                    tg_send(f"🎯🎯 تحقق الهدف الثاني لصفقة {tr['side']} ✅\n"
-                            f"TP2: {f(tr['tp2'])} — الصفقة مكتملة.\n"
-                            + stamp(ns, c.t, "عند شمعة", full=False))
+                    self.close_trade(tr, "TP2", tr["tp2"], c.t)
+                    self.q(f"🎯🎯 تحقق الهدف الثاني لصفقة {tag} ✅\n"
+                           f"TP2: {f(tr['tp2'])} — الصفقة مكتملة.\n"
+                           + stamp(ns, c.t, "عند شمعة", full=False))
                     break
-                if tr["tp1_hit"] and (c.l <= tr["sl"] if long else c.h >= tr["sl"]):
-                    tr["done"] = True
-                    tg_send(f"↩️ أُغلقت صفقة {tr['side']} عند الدخول بعد تحقق الهدف الأول.\n"
-                            + stamp(ns, c.t, "عند شمعة", full=False))
+                if was_tp1 and (c.l <= tr["sl"] if long else c.h >= tr["sl"]):
+                    self.close_trade(tr, "TP1_BE", tr["entry"], c.t)
+                    self.q(f"↩️ أُغلقت صفقة {tag} عند الدخول بعد تحقق الهدف الأول.\n"
+                           + stamp(ns, c.t, "عند شمعة", full=False))
                     break
+
+            # تحذير انعكاس: الصفقة تنقلب قبل الوصول للهدف الأول (بدون تقييد عدد الصفقات)
+            if tr["done"] or tr["tp1_hit"] or tr.get("warned"):
+                continue
+            reason = None
+            if tr.get("kind") != "RB":   # صفقات RB يغطيها تنبيه الإلغاء
+                for c in ns.closed:
+                    if c.t <= tr["from"] or c.t.time() >= CLOSE:
+                        continue
+                    if (long and c.c < tr["ref"]) or ((not long) and c.c > tr["ref"]):
+                        reason = (f"كسر عكسي: إغلاق شمعة {'تحت' if long else 'فوق'} "
+                                  f"حافة المنطقة {f(tr['ref'])}")
+                        break
+            if not reason:
+                for b in self.rb_boxes:
+                    if b["conf_t"] > tr["from"] and (b["side"] == "UP") != long:
+                        reason = ("ظهور RB معاكس "
+                                  f"({'↑' if b['side'] == 'UP' else '↓'}) "
+                                  f"عند {f(b['lo'])} – {f(b['hi'])}")
+                        break
+            if reason:
+                tr["warned"] = True
+                self.q(f"⚠️ تحذير انعكاس — صفقة {tag}\n"
+                       f"السبب: {reason}\n"
+                       f"الدخول: {f(tr['entry'])} | الوقف: {f(tr['sl'])} | "
+                       f"الهدف الأول: {f(tr['tp1'])}\n"
+                       f"السعر الآن: {f(ns.price)}\n"
+                       "الصفقة قد تنقلب قبل الهدف؛ فكّر في تقليل المخاطرة أو الخروج.\n"
+                       + stamp(ns, ns.last_t, "آخر شمعة في البيانات"))
+
+    # ---- نهاية اليوم: إغلاق الصفقات المتبقية وتسجيل التوقعات والملخص ----
+    def end_of_day(self, ns):
+        done_today = [c for c in ns.closed
+                      if c.t.date() == ns.now.date() and c.t.time() < CLOSE]
+        if not done_today:
+            return
+        final = done_today[-1].c
+        for tr in self.trades:
+            if not tr["done"]:
+                self.close_trade(tr, "EOD", final, ns.now)
+
+        wins = [t for t in self.trades if t.get("result") in WIN_RESULTS]
+        losses = [t for t in self.trades if t.get("result") == "SL"]
+        eod = [t for t in self.trades if t.get("result") == "EOD"]
+        total_r = sum(t.get("r", 0) for t in self.trades)
+        L = [f"📋 ملخص نهاية اليوم — {ns.now.strftime('%Y-%m-%d')}",
+             "━━━━━━━━━━━━━━",
+             f"إغلاق SPX: {f(final)}", "",
+             f"🔹 الصفقات: {len(self.trades)} | رابحة {len(wins)} | خاسرة {len(losses)} "
+             f"| أُغلقت بنهاية الجلسة {len(eod)}",
+             f"مجموع النتيجة: {total_r:+.2f}R"]
+        for t in self.trades:
+            L.append(f"• {t['side']} {t.get('kind', '')} (درجة {t.get('score', '-')}) "
+                     f"{hm(t['from'])} → {RESULT_AR.get(t.get('result'), '-')} "
+                     f"({t.get('r', 0):+.2f}R)")
+        L += ["", "🔹 توقعات الإغلاق"]
+        if not self.preds:
+            L.append("لا توجد توقعات مسجلة اليوم.")
+        pts = 0
+        scored = 0
+        for p in self.preds:
+            if p["side"] == "CALL":
+                res = "WIN" if final >= p["pred"] else "LOSS"
+            elif p["side"] == "PUT":
+                res = "WIN" if final <= p["pred"] else "LOSS"
+            else:
+                res = "NONE"
+            if res != "NONE":
+                scored += 1
+                pts += res == "WIN"
+            csv_append(PRED_CSV, PRED_HEADER, [
+                ns.now.strftime("%Y-%m-%d"), p["alert"], p["t"].strftime("%H:%M"),
+                f"{p['price']:.2f}", f"{p['pred']:.2f}", p["side"], f"{final:.2f}", res])
+            res_ar = {"WIN": "نقطة ✅", "LOSS": "خسارة ❌", "NONE": "بدون توصية ⚪"}[res]
+            L.append(f"• قبل {p['alert']} د: {p['side']} — المتوقع {f(p['pred'])} → {res_ar}")
+        if scored:
+            L.append(f"النتيجة: {pts} من {scored}")
+        L += ["", "للإحصائيات التراكمية أرسل /stats"]
+        tg_send("\n".join(L))
+
+    # ---- /stats ----
+    def stats_text(self):
+        trades = csv_read(TRADES_CSV)
+        preds = csv_read(PRED_CSV)
+        L = ["📈 إحصائيات البوت (من السجلات المحفوظة)", "━━━━━━━━━━━━━━"]
+        if not trades and not preds:
+            L.append("لا توجد سجلات بعد؛ تُسجل النتائج بعد نهاية كل يوم تداول.")
+        if trades:
+            w = [t for t in trades if t["result"] in WIN_RESULTS]
+            l = [t for t in trades if t["result"] == "SL"]
+            e = [t for t in trades if t["result"] == "EOD"]
+            closed = len(w) + len(l)
+            rate = f"{len(w) / closed * 100:.0f}%" if closed else "—"
+            tr_r = sum(float(t["r_multiple"]) for t in trades)
+            days = len({t["date"] for t in trades})
+            L += [f"🔹 الصفقات ({days} يوم): {len(trades)}",
+                  f"رابحة {len(w)} | خاسرة {len(l)} | نهاية الجلسة {len(e)}",
+                  f"نسبة النجاح (رابحة ÷ رابحة+خاسرة): {rate}",
+                  f"مجموع النتيجة: {tr_r:+.2f}R"]
+            by = {}
+            for t in trades:
+                d = by.setdefault(t["kind"], [0, 0])
+                d[0] += t["result"] in WIN_RESULTS
+                d[1] += t["result"] == "SL"
+            L.append("حسب النوع: " + " | ".join(f"{k}: {v[0]}✅/{v[1]}❌" for k, v in by.items()))
+            by = {}
+            for t in trades:
+                d = by.setdefault(t["score"], [0, 0])
+                d[0] += t["result"] in WIN_RESULTS
+                d[1] += t["result"] == "SL"
+            L.append("حسب الدرجة: " + " | ".join(
+                f"{k}: {v[0]}✅/{v[1]}❌" for k, v in sorted(by.items())))
+        if preds:
+            sc = [p for p in preds if p["result"] in ("WIN", "LOSS")]
+            ok = [p for p in sc if p["result"] == "WIN"]
+            L += ["", f"🔹 توقعات الإغلاق: {len(ok)} نقطة من {len(sc)}"]
+            for a in ("30", "15"):
+                s2 = [p for p in sc if p["alert"] == a]
+                o2 = [p for p in s2 if p["result"] == "WIN"]
+                if s2:
+                    L.append(f"تنبيه {a} دقيقة: {len(o2)} من {len(s2)}")
+        today_open = [t for t in self.trades if not t["done"]]
+        if today_open:
+            L += ["", f"صفقات مفتوحة الآن: {len(today_open)}"]
+        return "\n".join(L)
 
     # ---- الدورة الرئيسية ----
     def tick(self):
         now = datetime.now(NY)
-        if now.weekday() >= 5 or not (OPEN <= now.time() <= dtime(16, 1)):
+        if now.weekday() >= 5 or not (OPEN <= now.time() <= END_WINDOW):
             return
         with self.lock:
             ns = self.snapshot()
             if ns is None:       # عطلة أو لا بيانات
                 return
-            self.check_alerts(ns)
+            try:
+                self.check_alerts(ns)
+            finally:
+                self.flush()
             for h, m, kind in SCHEDULE:
                 due = now.replace(hour=h, minute=m, second=0, microsecond=0)
                 key = (now.date(), h, m)
-                if due <= now < due + timedelta(minutes=5) and key not in self.fired:
+                if key in self.fired:
+                    continue
+                if kind == "eod":
+                    if due <= now < due + timedelta(minutes=10):
+                        complete = ns.today[-1].t.time() >= dtime(15, 55)
+                        if complete or now >= due + timedelta(minutes=8):
+                            self.fired.add(key)
+                            self.end_of_day(ns)
+                    continue
+                if due <= now < due + timedelta(minutes=5):
                     self.fired.add(key)
                     if kind == "report":
                         tg_send(self.report_text(ns))
                     else:
-                        tg_send(self.close_text(ns, 30 if kind == "close30" else 15))
+                        text, info = self.close_text(ns, 30 if kind == "close30" else 15)
+                        self.preds.append(info)
+                        tg_send(text)
 
     def run(self, until=None):
         """until: وقت التوقف (datetime بتوقيت نيويورك)، أو None للتشغيل الدائم"""
@@ -848,8 +1176,9 @@ class Bot:
             try:
                 self.tick()
                 self.save_state()
-            except Exception:
+            except Exception as e:
                 log.exception("خطأ في الدورة")
+                self.alert_error("الدورة الرئيسية", e)
             time.sleep(LOOP_SECONDS)
         log.info("انتهت مرحلة التشغيل الحالية")
 
@@ -880,22 +1209,23 @@ class Bot:
                             ns = self.snapshot()
                         tg_send(self.report_text(ns) if ns else
                                 "⏸️ لا توجد بيانات جلسة اليوم (السوق مغلق أو عطلة).", chat)
+                    elif text.startswith("/stats"):
+                        tg_send(self.stats_text(), chat)
                     elif text.startswith("/status"):
                         tg_send(f"✅ البوت يعمل\nالوقت (نيويورك): "
                                 f"{datetime.now(NY).strftime('%Y-%m-%d %H:%M')}\n"
                                 f"صفقات اليوم: {self.count}", chat)
                     elif text.startswith(("/start", "/help")):
-                        tg_send("الأوامر:\n/report — تقرير فوري\n/status — حالة البوت", chat)
-            except Exception:
+                        tg_send("الأوامر:\n/report — تقرير فوري\n/stats — إحصائيات النتائج\n"
+                                "/status — حالة البوت", chat)
+            except Exception as e:
                 log.exception("خطأ في استقبال الأوامر")
+                self.alert_error("استقبال الأوامر", e)
                 time.sleep(5)
 
 
 def main():
     need = {"TELEGRAM_TOKEN": TG_TOKEN, "TELEGRAM_CHAT_ID": TG_CHAT}
-    if DATA_SOURCE == "capital":
-        need.update({"CAPITAL_API_KEY": API_KEY, "CAPITAL_IDENTIFIER": API_ID,
-                     "CAPITAL_PASSWORD": API_PW})
     missing = [k for k, v in need.items() if not v]
     if missing:
         raise SystemExit("متغيرات بيئية ناقصة: " + ", ".join(missing))
@@ -905,10 +1235,10 @@ def main():
         until = now + timedelta(minutes=int(test))
     elif os.getenv("CI_WINDOWS") == "1":       # تشغيل GitHub Actions على مرحلتين
         t = now.time()
-        if now.weekday() >= 5 or t >= dtime(16, 5) or t < dtime(8, 55):
+        if now.weekday() >= 5 or t >= dtime(16, 35) or t < dtime(8, 55):
             log.info("خارج نافذة التشغيل؛ إنهاء.")
             return
-        stop = dtime(12, 40) if t < dtime(12, 40) else dtime(16, 5)
+        stop = dtime(12, 40) if t < dtime(12, 40) else dtime(16, 35)
         until = now.replace(hour=stop.hour, minute=stop.minute, second=0, microsecond=0)
     else:
         until = None                           # تشغيل دائم على خادم عادي
