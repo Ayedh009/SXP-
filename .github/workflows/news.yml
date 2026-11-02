@@ -1,0 +1,51 @@
+name: News Bot
+
+on:
+  schedule:
+    - cron: "*/5 * * * 1-5"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: "اكتب 1 لإرسال ملخص الأسبوع واليوم فوراً للتجربة (اتركه فارغاً للتشغيل العادي)"
+        required: false
+        default: ""
+
+concurrency:
+  group: news-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - uses: actions/cache/restore@v4
+        with:
+          path: news_state.json
+          key: news-state-${{ github.run_id }}
+          restore-keys: news-state-
+
+      - name: Run news bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NEWS_TEST: ${{ github.event.inputs.test }}
+        run: python news_bot.py
+
+      - uses: actions/cache/save@v4
+        if: always() && hashFiles('news_state.json') != ''
+        with:
+          path: news_state.json
+          key: news-state-${{ github.run_id }}
