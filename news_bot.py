@@ -40,6 +40,83 @@ ERROR_GAP = 3 * 3600       # أقل فاصل بين تنبيهي عطل
 DAYS_AR = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
 IMPACT = {"High": ("🔴", "عالية"), "Medium": ("🟠", "متوسطة")}
 
+# ── ترجمة أسماء الأخبار (أي خبر غير موجود هنا يظهر بالإنجليزي كما هو) ──
+TITLES = {
+    "CPI": "مؤشر أسعار المستهلكين (التضخم)",
+    "Core CPI": "التضخم الأساسي (CPI)",
+    "PPI": "مؤشر أسعار المنتجين",
+    "Core PPI": "أسعار المنتجين الأساسية",
+    "Core PCE Price Index": "مؤشر PCE الأساسي (تضخم الفيدرالي المفضل)",
+    "PCE Price Index": "مؤشر أسعار PCE",
+    "Non-Farm Employment Change": "الوظائف غير الزراعية (NFP)",
+    "ADP Non-Farm Employment Change": "وظائف القطاع الخاص ADP",
+    "Unemployment Rate": "معدل البطالة",
+    "Unemployment Claims": "طلبات إعانة البطالة الأسبوعية",
+    "Average Hourly Earnings": "متوسط الأجر بالساعة",
+    "JOLTS Job Openings": "الوظائف الشاغرة JOLTS",
+    "Federal Funds Rate": "قرار الفائدة الأمريكية",
+    "FOMC Statement": "بيان الفيدرالي FOMC",
+    "FOMC Press Conference": "مؤتمر الفيدرالي الصحفي",
+    "FOMC Meeting Minutes": "محضر اجتماع الفيدرالي",
+    "FOMC Economic Projections": "توقعات الفيدرالي الاقتصادية",
+    "Fed Chair Powell Speaks": "كلمة رئيس الفيدرالي باول",
+    "Retail Sales": "مبيعات التجزئة",
+    "Core Retail Sales": "مبيعات التجزئة الأساسية",
+    "GDP": "الناتج المحلي الإجمالي",
+    "Advance GDP": "الناتج المحلي الإجمالي",
+    "ISM Manufacturing PMI": "مؤشر ISM للتصنيع",
+    "ISM Services PMI": "مؤشر ISM للخدمات",
+    "Flash Manufacturing PMI": "مؤشر مديري المشتريات للتصنيع",
+    "Flash Services PMI": "مؤشر مديري المشتريات للخدمات",
+    "UoM Consumer Sentiment": "ثقة المستهلك (جامعة ميشيغان)",
+    "UoM Inflation Expectations": "توقعات التضخم (جامعة ميشيغان)",
+    "CB Consumer Confidence": "ثقة المستهلك (كونفرنس بورد)",
+    "Durable Goods Orders": "طلبيات السلع المعمرة",
+    "Core Durable Goods Orders": "طلبيات السلع المعمرة الأساسية",
+    "Empire State Manufacturing Index": "مؤشر إمباير ستيت للتصنيع",
+    "Philly Fed Manufacturing Index": "مؤشر فيلادلفيا الفيدرالي للتصنيع",
+    "Crude Oil Inventories": "مخزونات النفط الخام",
+    "Natural Gas Storage": "مخزونات الغاز الطبيعي",
+    "Existing Home Sales": "مبيعات المنازل القائمة",
+    "New Home Sales": "مبيعات المنازل الجديدة",
+    "Pending Home Sales": "مبيعات المنازل المعلقة",
+    "Building Permits": "تصاريح البناء",
+    "Housing Starts": "بدء إنشاء المنازل",
+    "Trade Balance": "الميزان التجاري",
+    "Personal Income": "الدخل الشخصي",
+    "Personal Spending": "الإنفاق الشخصي",
+    "Industrial Production": "الإنتاج الصناعي",
+    "Factory Orders": "طلبيات المصانع",
+    "Import Prices": "أسعار الواردات",
+    "Employment Cost Index": "مؤشر تكلفة التوظيف",
+    "Challenger Job Cuts": "تسريحات الوظائف Challenger",
+    "Congressional Elections": "انتخابات الكونغرس الأمريكي",
+    "Presidential Election": "الانتخابات الرئاسية الأمريكية",
+}
+SUFFIX = {"m/m": "(شهري)", "y/y": "(سنوي)", "q/q": "(ربع سنوي)"}
+PREFIX = {"Prelim": "أولي", "Final": "نهائي", "Flash": "مبدئي",
+          "Revised": "معدّل", "Advance": "مبدئي"}
+
+
+def ar(title):
+    """الاسم بالعربي مع الأصل الإنجليزي بين قوسين؛ أو الإنجليزي فقط إن لم يُعرف."""
+    t = title.strip()
+    suffix = ""
+    for k, v in SUFFIX.items():
+        if t.endswith(" " + k):
+            t, suffix = t[:-len(k) - 1], " " + v
+            break
+    base = TITLES.get(t)
+    if base is None:
+        first, _, rest = t.partition(" ")
+        if first in PREFIX and rest in TITLES:
+            base = f"{TITLES[rest]} ({PREFIX[first]})"
+    if base is None and t.endswith(" Speaks"):
+        base = f"كلمة {t[:-len(' Speaks')]}"
+    if base is None:
+        return title
+    return f"{base}{suffix} ({title})"
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("newsbot")
 
@@ -129,7 +206,7 @@ def when(e):
 
 def line(e):
     emo, _ = IMPACT[e["impact"]]
-    return f"{emo} {when(e)} — {e['title']}"
+    return f"{emo} {when(e)} — {ar(e['title'])}"
 
 
 def weekly_text(events):
@@ -163,7 +240,7 @@ def remind_text(e, mins):
     emo, name = IMPACT[e["impact"]]
     mins = max(int(round(mins)), 1)
     L = [f"⏰ خبر بعد {mins} دقيقة {emo}",
-         f"📌 {e['title']}",
+         f"📌 {ar(e['title'])}",
          f"🕒 {when(e)}",
          f"الأهمية: {name}"]
     if e["forecast"] or e["previous"]:
@@ -176,7 +253,7 @@ def release_text(e):
     emo, name = IMPACT[e["impact"]]
     return "\n".join([
         f"📢 صدر الآن {emo}",
-        f"📌 {e['title']}",
+        f"📌 {ar(e['title'])}",
         f"🕒 {when(e)}",
         f"التوقع: {e['forecast'] or '—'} | السابق: {e['previous'] or '—'}",
         "القيمة الفعلية غير متوفرة في المصدر المجاني؛ راجع التقويم أو الشارت.",
