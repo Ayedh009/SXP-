@@ -4,9 +4,10 @@
 - تقرير ساعي أثناء الجلسة الأمريكية
 - تنبيهات آخر 30 و 15 دقيقة مع توقع سعر الإغلاق
 - إشارات: Call/Put من الأوردربلوك والفجوات، وإشارة Rejection Block (RB)
+- إشارة Σ (سيغما) على فريم 5 دقائق: شمعة رفض بذيل طويل مع احتمال + نافذة زمنية + حركة متوقعة
 - درجة لكل إشارة (ضعيفة / متوسطة / قوية) من تقاطع RB و OB و FVG وخط الكنترول
 - سحب السيولة قبل RB، تنبيه إعادة اختبار الصندوق، رسالة إلغاء، تحذير انعكاس
-- سجل صفقات + سجل توقعات الإغلاق (مجلد stats) + أمر /stats + ملخص نهاية اليوم
+- سجل صفقات + سجل توقعات الإغلاق + سجل Σ (مجلد stats) + أمر /stats + ملخص نهاية اليوم
 - تنبيه عند حدوث عطل بدل الصمت، ودمج التنبيهات المتقاربة في رسالة واحدة
 - أوامر يدوية: /report  /status  /stats  /help
 
@@ -55,6 +56,7 @@ STATE_FILE = os.getenv("STATE_FILE", "state.json")
 STATS_DIR = os.getenv("STATS_DIR", "stats")
 TRADES_CSV = os.path.join(STATS_DIR, "trades.csv")
 PRED_CSV = os.path.join(STATS_DIR, "close_predictions.csv")
+SIGMA_CSV = os.path.join(STATS_DIR, "sigma_log.csv")
 LOOP_SECONDS = 45          # دورة المراقبة
 HEAVY_REFRESH = 600        # تحديث البيانات الثقيلة كل 10 دقائق
 SIGNAL_COOLDOWN_MIN = 30   # أقل فاصل بين إشارتي أوردربلوك/فجوة في نفس الاتجاه
@@ -67,6 +69,11 @@ RB_MIN_RANGE_ATR = 0.8     # مدى شمعة الرفض >= 0.8 من ATR (لتج�
 RB_SWING_LOOKBACK = 10     # الرفض عند قاع/قمة محلية آخر 10 شموع
 RB_STOP_ATR = 0.25         # الوقف = خلف حافة الصندوق + 0.25 ATR
 RB_MIN_RISK_ATR = 0.5      # أقل مسافة للوقف عن الدخول = 0.5 ATR
+
+# ── إعدادات إشارة Σ (سيغما) — تعمل على شموع 5 دقائق فقط ──
+SIGMA_ENABLED = True
+SIGMA_MIN_PROB = 45        # لا تُرسل الإشارة لو الاحتمال التقديري أقل من هذا الرقم
+SIGMA_MAX_PROB = 85        # سقف الاحتمال المعروض
 
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -392,6 +399,8 @@ TRADE_HEADER = ["date", "open_time_ny", "close_time_ny", "side", "kind", "score"
                 "entry", "stop", "tp1", "tp2", "exit", "result", "r_multiple"]
 PRED_HEADER = ["date", "alert", "alert_time_ny", "price", "predicted", "side",
                "final_close", "result"]
+SIGMA_HEADER = ["date", "time_ny", "side", "entry", "target", "prob", "exp_move",
+                "win_lo_min", "win_hi_min", "score", "sweep", "result"]
 
 
 def csv_append(path, header, row):
@@ -433,6 +442,8 @@ def _dec(d, keys):
 RESULT_AR = {"TP2": "حقق الهدف الثاني ✅", "TP1_BE": "حقق الهدف الأول ثم خرج عند الدخول ✅",
              "SL": "ضُرب الوقف ❌", "EOD": "أُغلقت بنهاية الجلسة ⏹"}
 WIN_RESULTS = ("TP2", "TP1_BE")
+SIGMA_RESULT_AR = {"HIT": "حققت الحركة المتوقعة ✅", "MISS": "لم تحقق الحركة في النافذة ❌",
+                   "EOD": "انتهت الجلسة قبل الحسم ⏹"}
 
 
 # ───────────────────────── البوت ─────────────────────────
@@ -449,6 +460,8 @@ class Bot:
         self.cross_seen = set()
         self.rb_seen = set()
         self.rb_boxes = []
+        self.sigma_seen = set()
+        self.sigmas = []
         self.preds = []
         self.last_signal = {}
         self.trades = []
@@ -469,6 +482,8 @@ class Bot:
                 "cross_seen": [t.isoformat() for t in self.cross_seen],
                 "rb_seen": list(self.rb_seen),
                 "rb_boxes": [_enc(b) for b in self.rb_boxes],
+                "sigma_seen": list(self.sigma_seen),
+                "sigmas": [_enc(s) for s in self.sigmas],
                 "preds": [_enc(p) for p in self.preds],
                 "last_signal": {k: v.isoformat() for k, v in self.last_signal.items()},
                 "trades": [_enc(tr) for tr in self.trades],
@@ -494,6 +509,8 @@ class Bot:
             self.cross_seen = {datetime.fromisoformat(t) for t in d["cross_seen"]}
             self.rb_seen = set(d.get("rb_seen", []))
             self.rb_boxes = [_dec(b, ["rej_t", "conf_t"]) for b in d.get("rb_boxes", [])]
+            self.sigma_seen = set(d.get("sigma_seen", []))
+            self.sigmas = [_dec(s, ["t0"]) for s in d.get("sigmas", [])]
             self.preds = [_dec(p, ["t"]) for p in d.get("preds", [])]
             self.last_signal = {k: datetime.fromisoformat(v) for k, v in d["last_signal"].items()}
             self.trades = [_dec(tr, ["from"]) for tr in d["trades"]]
@@ -730,6 +747,7 @@ class Bot:
             self.signaled.clear(); self.touched.clear()
             self.fvg_seen.clear(); self.cross_seen.clear()
             self.rb_seen.clear(); self.rb_boxes.clear(); self.preds.clear()
+            self.sigma_seen.clear(); self.sigmas.clear()
             self.trades.clear(); self.fired.clear(); self.last_signal.clear()
             self.outbox.clear()
 
@@ -776,9 +794,14 @@ class Bot:
             # 4) Rejection Block (شمعة رفض + شمعة تأكيد)
             self.check_rb(ns)
 
+            # 4-ب) إشارة Σ سيغما (شمعة رفض 5 دقائق عند إغلاقها)
+            if SIGMA_ENABLED:
+                self.check_sigma(ns)
+
         # 5) متابعة الصناديق (إعادة اختبار / إلغاء) والصفقات المفتوحة
         self.rb_lifecycle(ns)
         self.track_trades(ns)
+        self.track_sigmas(ns)
 
         # 6) صفقة جديدة من أوردربلوك/فجوة (بدون حد لعدد الصفقات)
         if not live:
@@ -898,6 +921,129 @@ class Bot:
                 f"{stamp(ns, conf.t, 'شمعة التأكيد')}\n\n"
                 "⚠️ إشارة آلية للمساعدة وليست نصيحة مالية؛ التزم بإدارة المخاطر."
             )
+
+    # ---- إشارة Σ (سيغما) على فريم 5 دقائق ----
+    def check_sigma(self, ns):
+        """Σ تظهر فور إغلاق شمعة رفض (ذيل طويل عند قاع/قمة محلية) على فريم 5 دقائق،
+        بدون انتظار شمعة تأكيد. تحمل: الاتجاه، احتمال تقديري، نافذة زمنية بالدقائق،
+        وحركة متوقعة بالنقاط. تُفحص آخر شمعتين مغلقتين فقط."""
+        cs = ns.closed
+        n = len(cs)
+        a = ns.atr5
+        for i in range(max(n - 2, RB_SWING_LOOKBACK + 1), n):
+            rej = cs[i]
+            if rej.t.date() != ns.now.date() or not (OPEN <= rej.t.time() < CLOSE):
+                continue
+            side = rb_side(cs, i, a)
+            if not side:
+                continue
+            key = f"SIG-{side}-{rej.t.isoformat()}"
+            if key in self.sigma_seen:
+                continue
+            self.sigma_seen.add(key)
+
+            up = side == "UP"
+            top, bot = max(rej.o, rej.c), min(rej.o, rej.c)
+            rng = rej.h - rej.l
+            wick = (bot - rej.l) if up else (rej.h - top)
+            wick_pct = wick / rng * 100 if rng else 0.0
+
+            sw = sweep_info(cs, i, ns.prev_high, ns.prev_low, side)
+            score, fl = self.confluence(ns, bot, top, up)
+
+            # الاحتمال التقديري: قاعدة 45% + نقاط من جودة الشمعة والتقاطعات
+            prob = 45.0
+            prob += min(max(wick_pct - 50.0, 0.0) * 0.3, 8.0)     # طول الذيل
+            if sw:
+                prob += 8.0                                       # سحب سيولة
+            prob += 6.0 * (int(fl["OB"]) + int(fl["FVG"]) + int(fl["CTRL"]))
+            htf = ns.bias1h if up else -ns.bias1h
+            prob += 5.0 if htf > 0 else (-5.0 if htf < 0 else 0.0)
+            vols = [c.v for c in cs[max(i - 20, 0):i] if c.v > 0]
+            if vols and rej.v > 1.3 * (sum(vols) / len(vols)):
+                prob += 4.0                                       # حجم مرتفع
+            prob = int(round(max(35.0, min(float(SIGMA_MAX_PROB), prob))))
+            if prob < SIGMA_MIN_PROB:
+                continue
+
+            # الحركة المتوقعة بالنقاط (من طول الذيل و ATR، ولا تتجاوز المدى المتبقي لليوم)
+            exp = 0.5 * wick + 0.5 * a
+            exp = max(0.5 * a, min(2.0 * a, exp))
+            exp = min(exp, max(ns.remaining, 0.5 * a))
+            exp = round(exp, 1)
+
+            # النافذة الزمنية بالدقائق (سرعة تقديرية = نصف ATR لكل شمعة 5د)
+            center = exp / (0.5 * a) * 5.0
+            lo = max(5, int(center * 0.5))
+            hi = min(60, max(lo + 10, int(center * 1.5)))
+
+            entry = rej.c
+            target = entry + exp if up else entry - exp
+            t0 = rej.t + timedelta(minutes=5)           # لحظة إغلاق شمعة الرفض
+            self.sigmas.append({
+                "key": key, "side": "CALL" if up else "PUT", "entry": entry,
+                "target": target, "exp": exp, "prob": prob, "lo": lo, "hi": hi,
+                "t0": t0, "score": score, "sweep": bool(sw), "done": False,
+                "result": ""})
+
+            emoji = "🟢" if up else "🔴"
+            side_ar = "كول" if up else "بوت"
+            htf_txt = ("متوافق مع الفريم الكبير ✅" if htf > 0 else
+                       "عكس الفريم الكبير ⚠️" if htf < 0 else
+                       "الفريم الكبير محايد")
+            sweep_txt = (f"💧 سحب سيولة ({sw[0]} عند {f(sw[1])})" if sw
+                         else "💧 بدون سحب سيولة")
+            ext = f"{'قاع' if up else 'قمة'} الذيل: {f(rej.l if up else rej.h)}"
+            self.q(
+                f"Σ سيغما {side_ar} {emoji} — {prob}% — خلال {lo}-{hi} د — "
+                f"متوقع {exp:g}$\n━━━━━━━━━━━━━━\n"
+                f"الاتجاه: {'CALL' if up else 'PUT'} | الفريم: 5 دقائق\n"
+                f"سعر الدخول (إغلاق شمعة الرفض): {f(entry)}\n"
+                f"الهدف المتوقع: {f(target)} ({exp:+.1f} نقطة)\n"
+                f"النافذة: من {lo} إلى {hi} دقيقة بعد الإغلاق\n"
+                f"{ext} | طول الذيل: {wick_pct:.0f}% من الشمعة\n"
+                f"{sweep_txt}\n"
+                f"التقاطعات: {flags_text(fl)}\n"
+                f"{htf_txt}\n"
+                f"السعر الآن: {f(ns.price)}\n\n"
+                f"{stamp(ns, rej.t, 'شمعة Σ')}\n\n"
+                "⚠️ الاحتمال تقدير مبني على جودة الشمعة والتقاطعات وليس نسبة مثبتة؛ "
+                "قارنه بنتائج /stats مع الوقت. وليست نصيحة مالية."
+            )
+
+    def finish_sigma(self, s, result, t):
+        s["done"] = True
+        s["result"] = result
+        csv_append(SIGMA_CSV, SIGMA_HEADER, [
+            s["t0"].strftime("%Y-%m-%d"), (s["t0"] - timedelta(minutes=5)).strftime("%H:%M"),
+            s["side"], f"{s['entry']:.2f}", f"{s['target']:.2f}", s["prob"],
+            f"{s['exp']:.1f}", s["lo"], s["hi"], s["score"],
+            "1" if s["sweep"] else "0", result])
+
+    def track_sigmas(self, ns):
+        """يحسم كل إشارة Σ: تحققت الحركة المتوقعة داخل النافذة العليا أم لا."""
+        for s in self.sigmas:
+            if s["done"]:
+                continue
+            long = s["side"] == "CALL"
+            end = s["t0"] + timedelta(minutes=s["hi"])
+            hit_candle = None
+            for c in ns.c5:
+                if c.t < s["t0"] or c.t >= end or c.t.time() >= CLOSE:
+                    continue
+                if (long and c.h >= s["target"]) or ((not long) and c.l <= s["target"]):
+                    hit_candle = c
+                    break
+            if hit_candle is not None:
+                self.finish_sigma(s, "HIT", hit_candle.t)
+                mins = max((hit_candle.t + timedelta(minutes=5) - s["t0"]).total_seconds() / 60.0, 5.0)
+                self.q(f"Σ ✅ تحققت الحركة المتوقعة — {s['side']}\n"
+                       f"الدخول: {f(s['entry'])} → الهدف: {f(s['target'])} "
+                       f"({s['exp']:+.1f} نقطة)\n"
+                       f"خلال أقل من {mins:.0f} دقيقة (النافذة المتوقعة {s['lo']}-{s['hi']} د)\n"
+                       + stamp(ns, hit_candle.t, "عند شمعة", full=False))
+            elif ns.now >= end + timedelta(minutes=5):
+                self.finish_sigma(s, "MISS", ns.now)
 
     def rb_lifecycle(self, ns):
         """لكل صندوق RB فعّال: تنبيه إعادة اختبار (مرة واحدة)، أو إلغاء عند
@@ -1050,6 +1196,9 @@ class Bot:
         for tr in self.trades:
             if not tr["done"]:
                 self.close_trade(tr, "EOD", final, ns.now)
+        for s in self.sigmas:
+            if not s["done"]:
+                self.finish_sigma(s, "EOD", ns.now)
 
         wins = [t for t in self.trades if t.get("result") in WIN_RESULTS]
         losses = [t for t in self.trades if t.get("result") == "SL"]
@@ -1065,6 +1214,15 @@ class Bot:
             L.append(f"• {t['side']} {t.get('kind', '')} (درجة {t.get('score', '-')}) "
                      f"{hm(t['from'])} → {RESULT_AR.get(t.get('result'), '-')} "
                      f"({t.get('r', 0):+.2f}R)")
+        if self.sigmas:
+            hits = [s for s in self.sigmas if s["result"] == "HIT"]
+            miss = [s for s in self.sigmas if s["result"] == "MISS"]
+            L += ["", f"🔹 إشارات Σ: {len(self.sigmas)} | حققت الحركة {len(hits)} "
+                      f"| لم تحقق {len(miss)}"]
+            for s in self.sigmas:
+                L.append(f"• Σ {s['side']} {hm(s['t0'] - timedelta(minutes=5))} "
+                         f"({s['prob']}% — متوقع {s['exp']:g}$) → "
+                         f"{SIGMA_RESULT_AR.get(s['result'], '-')}")
         L += ["", "🔹 توقعات الإغلاق"]
         if not self.preds:
             L.append("لا توجد توقعات مسجلة اليوم.")
@@ -1094,8 +1252,9 @@ class Bot:
     def stats_text(self):
         trades = csv_read(TRADES_CSV)
         preds = csv_read(PRED_CSV)
+        sigs = csv_read(SIGMA_CSV)
         L = ["📈 إحصائيات البوت (من السجلات المحفوظة)", "━━━━━━━━━━━━━━"]
-        if not trades and not preds:
+        if not trades and not preds and not sigs:
             L.append("لا توجد سجلات بعد؛ تُسجل النتائج بعد نهاية كل يوم تداول.")
         if trades:
             w = [t for t in trades if t["result"] in WIN_RESULTS]
@@ -1122,6 +1281,28 @@ class Bot:
                 d[1] += t["result"] == "SL"
             L.append("حسب الدرجة: " + " | ".join(
                 f"{k}: {v[0]}✅/{v[1]}❌" for k, v in sorted(by.items())))
+        if sigs:
+            sc = [s for s in sigs if s["result"] in ("HIT", "MISS")]
+            ok = [s for s in sc if s["result"] == "HIT"]
+            L += ["", f"🔹 إشارات Σ: {len(sigs)} (محسومة {len(sc)})"]
+            if sc:
+                real = len(ok) / len(sc) * 100
+                try:
+                    avg_p = sum(float(s["prob"]) for s in sc) / len(sc)
+                    L.append(f"حققت الحركة: {len(ok)} من {len(sc)} ({real:.0f}%) "
+                             f"| متوسط الاحتمال المعلن {avg_p:.0f}%")
+                except Exception:
+                    L.append(f"حققت الحركة: {len(ok)} من {len(sc)} ({real:.0f}%)")
+                for sd, nm in (("CALL", "كول"), ("PUT", "بوت")):
+                    s2 = [s for s in sc if s["side"] == sd]
+                    o2 = [s for s in s2 if s["result"] == "HIT"]
+                    if s2:
+                        L.append(f"Σ {nm}: {len(o2)} من {len(s2)}")
+                for lo_p, hi_p in ((0, 54), (55, 64), (65, 100)):
+                    s3 = [s for s in sc if lo_p <= float(s["prob"]) <= hi_p]
+                    o3 = [s for s in s3 if s["result"] == "HIT"]
+                    if s3:
+                        L.append(f"احتمال {lo_p}–{hi_p}%: {len(o3)} من {len(s3)}")
         if preds:
             sc = [p for p in preds if p["result"] in ("WIN", "LOSS")]
             ok = [p for p in sc if p["result"] == "WIN"]
