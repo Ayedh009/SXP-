@@ -1,15 +1,20 @@
 name: News Bot
 
+# البوت يبقى شغالاً داخل كل تشغيلة (ويفحص كل 20 ثانية) بدل تشغيلة قصيرة كل 5 دقائق،
+# لأن جدولة GitHub تتأخر كثيراً. أوقات cron بتوقيت UTC وتغطي الشتاء والصيف.
 on:
   schedule:
-    - cron: "*/5 * * * 1-5"
+    - cron: "30 4 * * 1"      # الاثنين فجراً: ملخص الأسبوع (12:00 منتصف الليل بتوقيتك)
+    - cron: "30 11 * * 1-5"   # من قبل 7:00 صباحاً بتوقيتك: ملخص اليوم وأخبار الصباح
+    - cron: "0 17 * * 1-5"    # بقية جلسة نيويورك: أخبار الظهر والعصر
   workflow_dispatch:
     inputs:
       test:
-        description: "اكتب 1 لإرسال ملخص الأسبوع واليوم فوراً للتجربة (اتركه فارغاً للتشغيل العادي)"
+        description: "تجربة: إرسال ملخص الأسبوع واليوم فوراً (1 = نعم)"
         required: false
-        default: ""
+        default: "0"
 
+# تشغيلة واحدة فقط في كل مرة حتى لا تتكرر الرسائل
 concurrency:
   group: news-bot
   cancel-in-progress: false
@@ -20,18 +25,20 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
 
-      - run: pip install -r requirements.txt
+      - name: Install
+        run: pip install requests
 
-      - uses: actions/cache/restore@v4
+      # استرجاع حالة آخر تشغيلة (حتى لا تتكرر التنبيهات)
+      - name: Restore state
+        uses: actions/cache/restore@v4
         with:
           path: news_state.json
           key: news-state-${{ github.run_id }}
@@ -41,11 +48,14 @@ jobs:
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          NEWS_TEST: ${{ github.event.inputs.test }}
+          NEWS_TEST: ${{ github.event.inputs.test == '1' && '1' || '' }}
+          # مدة بقاء البوت شغالاً داخل التشغيلة (دقائق)
+          NEWS_LOOP_MINUTES: ${{ github.event_name == 'schedule' && (github.event.schedule == '30 4 * * 1' && '130' || github.event.schedule == '30 11 * * 1-5' && '335' || '300') || '' }}
         run: python news_bot.py
 
-      - uses: actions/cache/save@v4
-        if: always() && hashFiles('news_state.json') != ''
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
         with:
           path: news_state.json
           key: news-state-${{ github.run_id }}
