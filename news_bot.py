@@ -3,19 +3,24 @@
 بوت الأخبار الاقتصادية الأمريكية لتيليجرام (مجاني وبدون مفتاح)
 المصدر: تقويم Forex Factory المجاني (أخبار أمريكا USD فقط، الأهمية العالية والمتوسطة)
 
-- ملخص الأسبوع: كل اثنين 12:00 فجراً بتوقيت نيويورك
-- ملخص اليوم: كل يوم عمل 8:00 صباحاً بتوقيت نيويورك
-- تنبيه قبل كل خبر بـ 15 دقيقة
-- رسالة "صدر الآن" عند موعد صدور الخبر (التوقع والسابق؛ القيمة الفعلية
-  غير متوفرة مجاناً في هذا المصدر)
+المواعيد (بتوقيتك المحلي LOCAL_TZ — الافتراضي شيكاغو):
+- ملخص الأسبوع: كل اثنين 12:00 منتصف الليل (00:00) — فيه كل أخبار الأسبوع
+- ملخص اليوم: كل يوم عمل 7:00 صباحاً — أخبار اليوم
+- تذكير قبل كل خبر بـ 15 دقيقة
+- "صدر الآن" عند موعد الخبر
+- نتيجة الخبر (الفعلي مقابل التوقع) إذا وفّرها المصدر
 
-يعمل كتشغيلة قصيرة كل 5 دقائق عبر GitHub Actions (news.yml).
+طريقة التشغيل (لحل مشكلة التأخير):
+  NEWS_LOOP_MINUTES=330  → يبقى البوت شغالاً هذه المدة ويفحص كل 20 ثانية
+                           (بدل تشغيلة قصيرة كل 5 دقائق يتأخر جدولها في GitHub)
+  بدون المتغير → تمرير واحد فقط (السلوك القديم)
 المتغيرات: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID (عدة معرّفات مفصولة بفاصلة)
 اختياري: NEWS_TEST=1 لإرسال ملخص الأسبوع واليوم فوراً للتجربة
 المتطلبات: pip install requests
 """
 
 import os
+import re
 import json
 import time
 import logging
@@ -33,8 +38,19 @@ STATE_FILE = os.getenv("NEWS_STATE_FILE", "news_state.json")
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHATS = [c.strip() for c in os.getenv("TELEGRAM_CHAT_ID", "").split(",") if c.strip()]
 
-REMIND_MIN = 15            # التنبيه قبل الخبر بـ 15 دقيقة
-RELEASE_WINDOW_MIN = 90    # أقصى تأخر مسموح لإرسال رسالة "صدر الآن"
+# ── المواعيد بتوقيتك المحلي (ساعة، دقيقة) ──
+WEEKLY_AT = (0, 0)         # الاثنين 12:00 منتصف الليل
+WEEKLY_UNTIL_HOUR = 12     # لو تأخر التشغيل يُرسل حتى الساعة 12 ظهراً من نفس اليوم
+DAILY_AT = (7, 0)          # كل يوم عمل 7:00 صباحاً
+DAILY_UNTIL_HOUR = 11      # لو تأخر التشغيل يُرسل حتى الساعة 11 صباحاً
+
+REMIND_MIN = 15            # التذكير قبل الخبر بـ 15 دقيقة
+RELEASE_WINDOW_MIN = 30    # أقصى تأخر لإرسال "صدر الآن"
+RESULT_WINDOW_MIN = 90     # كم دقيقة بعد الخبر نبحث فيها عن النتيجة الفعلية
+CHECK_SECONDS = 20         # فاصل الفحص في وضع التشغيل المستمر
+FEED_REFRESH = 300         # تحديث التقويم كل 5 دقائق (المصدر يحجب الطلبات الأكثر)
+FEED_REFRESH_WAIT = 150    # تحديث أسرع بعد الخبر أثناء انتظار الرقم الفعلي
+FAIL_ALERT_AFTER = 20 * 60 # تنبيه عطل لو فشل جلب التقويم هذه المدة
 ERROR_GAP = 3 * 3600       # أقل فاصل بين تنبيهي عطل
 
 DAYS_AR = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس", "الجمعة", "السبت", "الأحد"]
@@ -117,8 +133,13 @@ def ar(title):
         return title
     return f"{base}{suffix} ({title})"
 
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("newsbot")
+
+
+def now_ny():
+    return datetime.now(NY)
 
 
 # ───────────────────────── تيليجرام ─────────────────────────
@@ -152,12 +173,16 @@ def load_state():
     s.setdefault("daily", "")
     s.setdefault("reminded", [])
     s.setdefault("released", [])
+    s.setdefault("results", [])
     s.setdefault("err_t", 0)
     return s
 
 
 def save_state(s):
     try:
+        s["reminded"] = s["reminded"][-300:]
+        s["released"] = s["released"][-300:]
+        s["results"] = s["results"][-300:]
         with open(STATE_FILE, "w", encoding="utf-8") as fh:
             json.dump(s, fh, ensure_ascii=False)
     except Exception:
@@ -165,9 +190,10 @@ def save_state(s):
 
 
 # ───────────────────────── جلب الأخبار ─────────────────────────
-def fetch_events():
+def fetch_events(attempts=3):
+    """يرجع (قائمة الأحداث، هل المصدر يوفّر حقل actual)."""
     last = None
-    for attempt in range(3):
+    for attempt in range(attempts):
         try:
             r = requests.get(FEED, timeout=20,
                              headers={"User-Agent": "Mozilla/5.0 (news-bot)"})
@@ -177,6 +203,7 @@ def fetch_events():
                 continue
             r.raise_for_status()
             rows = r.json()
+            has_actual = any("actual" in e for e in rows)
             out = []
             for e in rows:
                 if e.get("country") != "USD" or e.get("impact") not in IMPACT:
@@ -189,9 +216,10 @@ def fetch_events():
                     "impact": e["impact"],
                     "forecast": (e.get("forecast") or "").strip(),
                     "previous": (e.get("previous") or "").strip(),
+                    "actual": (e.get("actual") or "").strip(),
                 })
             out.sort(key=lambda x: x["t"])
-            return out
+            return out, has_actual
         except Exception as ex:
             last = ex
             time.sleep(2)
@@ -216,23 +244,23 @@ def weekly_text(events):
          "(🔴 أهمية عالية | 🟠 متوسطة)", "━━━━━━━━━━━━━━"]
     day = None
     for e in events:
-        d = e["t"].date()
-        if d != day:
-            day = d
-            L += ["", f"📌 {DAYS_AR[e['t'].weekday()]} {e['t'].strftime('%d/%m')}"]
+        loc = e["t"].astimezone(LOCAL)
+        if loc.date() != day:
+            day = loc.date()
+            L += ["", f"📌 {DAYS_AR[loc.weekday()]} {loc.strftime('%d/%m')}"]
         L.append(line(e))
     L += ["", "⚠️ التذبذب يزيد عادة حول الأخبار الحمراء؛ انتبه للإشارات قبلها وبعدها."]
     return "\n".join(L)
 
 
 def daily_text(events, today):
-    ev = [e for e in events if e["t"].date() == today]
+    ev = [e for e in events if e["t"].astimezone(LOCAL).date() == today]
     if not ev:
         return "📰 أخبار اليوم\nلا توجد أخبار أمريكية مهمة اليوم ✅"
-    L = [f"📰 تنبيه: توجد أخبار أمريكية اليوم ({DAYS_AR[today.weekday()]} "
+    L = [f"📰 أخبار اليوم الأمريكية ({DAYS_AR[today.weekday()]} "
          f"{today.strftime('%d/%m')})", "━━━━━━━━━━━━━━"]
     L += [line(e) for e in ev]
-    L += ["", "سيصلك تنبيه قبل كل خبر بـ 15 دقيقة، ورسالة عند صدوره."]
+    L += ["", "سيصلك تذكير قبل كل خبر بـ 15 دقيقة، ورسالة عند صدوره ثم النتيجة."]
     return "\n".join(L)
 
 
@@ -249,58 +277,158 @@ def remind_text(e, mins):
     return "\n".join(L)
 
 
-def release_text(e):
+def release_text(e, has_actual):
     emo, name = IMPACT[e["impact"]]
-    return "\n".join([
-        f"📢 صدر الآن {emo}",
-        f"📌 {ar(e['title'])}",
-        f"🕒 {when(e)}",
-        f"التوقع: {e['forecast'] or '—'} | السابق: {e['previous'] or '—'}",
-        "القيمة الفعلية غير متوفرة في المصدر المجاني؛ راجع التقويم أو الشارت.",
-        "⚠️ توقّع تذبذباً حاداً في الدقائق القادمة.",
-    ])
+    L = [f"📢 صدر الآن {emo}",
+         f"📌 {ar(e['title'])}",
+         f"🕒 {when(e)}",
+         f"التوقع: {e['forecast'] or '—'} | السابق: {e['previous'] or '—'}"]
+    if has_actual:
+        L.append("⏳ ستصلك النتيجة (الفعلي مقابل التوقع) فور توفرها في المصدر.")
+    else:
+        L.append("القيمة الفعلية غير متوفرة في المصدر المجاني؛ راجع التقويم أو الشارت.")
+    L.append("⚠️ توقّع تذبذباً حاداً في الدقائق القادمة.")
+    return "\n".join(L)
 
 
-# ───────────────────────── التشغيل ─────────────────────────
-def run(state):
-    now = datetime.now(NY)
-    test = os.getenv("NEWS_TEST") == "1"
-    events = fetch_events()
-    msgs = []        # (نص، دالة تسجّل أنه أُرسل)
+def _num(v):
+    """يحوّل نص مثل 3.1% أو 150K أو -0.2B إلى رقم (للمقارنة فقط)."""
+    if not v:
+        return None
+    s = v.replace(",", "").replace("%", "").strip()
+    mult = 1.0
+    if s and s[-1] in "KMBT":
+        mult = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}[s[-1]]
+        s = s[:-1]
+    if not re.fullmatch(r"-?\d+(\.\d+)?", s):
+        return None
+    return float(s) * mult
 
-    # ملخص الأسبوع: الاثنين من 12:00 فجراً (يُرسل مرة واحدة)
-    wk = now.strftime("%G-W%V")
-    if test or (now.weekday() == 0 and now.hour < 20 and state["weekly"] != wk):
-        msgs.append((weekly_text(events), lambda: state.update(weekly=wk)))
 
-    # ملخص اليوم: أيام العمل من 8:00 صباحاً (يُرسل مرة واحدة)
-    today = now.date()
-    if test or (now.weekday() < 5 and now.hour >= 8 and now.hour < 16
-                and state["daily"] != str(today)):
-        msgs.append((daily_text(events, today), lambda: state.update(daily=str(today))))
+def _cmp(a, b, label):
+    x, y = _num(a), _num(b)
+    if x is None or y is None:
+        return None
+    if abs(x - y) < 1e-9:
+        return f"{label}: مطابق ➖"
+    return f"{label}: {'أعلى ⬆️' if x > y else 'أقل ⬇️'}"
 
-    # تنبيه قبل الخبر + رسالة صدور الخبر
-    for e in events:
-        mins = (e["t"] - now).total_seconds() / 60.0
-        if 0 < mins <= REMIND_MIN and e["id"] not in state["reminded"]:
-            msgs.append((remind_text(e, mins),
-                         lambda i=e["id"]: state["reminded"].append(i)))
-        if -RELEASE_WINDOW_MIN <= mins <= 0 and e["id"] not in state["released"]:
-            msgs.append((release_text(e),
-                         lambda i=e["id"]: state["released"].append(i)))
 
-    if not msgs:
-        log.info("لا جديد الآن.")
-        return
-    # دمج رسائل نفس التشغيلة في رسالة واحدة
-    text = "\n\n──────────────\n\n".join(m for m, _ in msgs)
-    if len(text) > 3800:
-        for m, mark in msgs:
-            if tg_send(m):
+def result_text(e):
+    emo, _ = IMPACT[e["impact"]]
+    L = [f"📊 نتيجة الخبر {emo}",
+         f"📌 {ar(e['title'])}",
+         f"🕒 {when(e)}",
+         f"الفعلي: {e['actual']}",
+         f"التوقع: {e['forecast'] or '—'} | السابق: {e['previous'] or '—'}"]
+    c1 = _cmp(e["actual"], e["forecast"], "مقارنة بالتوقع")
+    c2 = _cmp(e["actual"], e["previous"], "مقارنة بالسابق")
+    L += [c for c in (c1, c2) if c]
+    L.append("⚠️ ارتفاع الرقم ليس صعوداً أو هبوطاً للسوق دائماً؛ راقب ردة فعل الشارت.")
+    return "\n".join(L)
+
+
+# ───────────────────────── البوت ─────────────────────────
+class NewsBot:
+    def __init__(self):
+        self.state = load_state()
+        self.events = []
+        self.has_actual = False
+        self.next_fetch = 0.0
+        self.fail_since = None
+        self.logged = False
+
+    def _waiting_actual(self, now):
+        """هل هناك خبر صدر قبل قليل وننتظر رقمه الفعلي؟"""
+        if not self.has_actual:
+            return False
+        for e in self.events:
+            m = (now - e["t"]).total_seconds() / 60.0
+            if 0 <= m <= RESULT_WINDOW_MIN and not e["actual"]:
+                return True
+        return False
+
+    def refresh(self, now, strict=False):
+        t = time.time()
+        if not strict and t < self.next_fetch:
+            return
+        try:
+            self.events, self.has_actual = fetch_events()
+            self.fail_since = None
+            self.next_fetch = t + (FEED_REFRESH_WAIT if self._waiting_actual(now)
+                                   else FEED_REFRESH)
+            if not self.logged:
+                self.logged = True
+                log.info("تم جلب %d خبراً؛ المصدر يوفّر الرقم الفعلي: %s",
+                         len(self.events), self.has_actual)
+        except Exception as ex:
+            if strict:
+                raise
+            if self.fail_since is None:
+                self.fail_since = t
+            self.next_fetch = t + 60
+            log.warning("فشل تحديث التقويم (سأعيد المحاولة): %s", ex)
+            if t - self.fail_since > FAIL_ALERT_AFTER:
+                alert_error(self.state, ex)
+
+    def step(self, now=None, test=False, strict=False):
+        now = now or now_ny()
+        self.refresh(now, strict=strict)
+        ev = self.events
+        if not ev:
+            return
+        st = self.state
+        loc = now.astimezone(LOCAL)
+        msgs = []   # (نص، دالة تسجّل أنه أُرسل)
+
+        # ملخص الأسبوع: الاثنين 12:00 منتصف الليل بتوقيتك (مرة واحدة)
+        wk = loc.strftime("%G-W%V")
+        if test or (loc.weekday() == 0 and (loc.hour, loc.minute) >= WEEKLY_AT
+                    and loc.hour < WEEKLY_UNTIL_HOUR and st["weekly"] != wk):
+            wstart = loc.date() - timedelta(days=loc.weekday())
+            wend = wstart + timedelta(days=6)
+            wev = [e for e in ev if wstart <= e["t"].astimezone(LOCAL).date() <= wend]
+            if wev or test:   # لو التقويم لم يتحدث لأسبوع جديد بعد ننتظر التحديث
+                msgs.append((weekly_text(wev), lambda: st.update(weekly=wk)))
+
+        # ملخص اليوم: أيام العمل 7:00 صباحاً بتوقيتك (مرة واحدة)
+        today = loc.date()
+        if test or (loc.weekday() < 5 and (loc.hour, loc.minute) >= DAILY_AT
+                    and loc.hour < DAILY_UNTIL_HOUR and st["daily"] != str(today)):
+            msgs.append((daily_text(ev, today), lambda: st.update(daily=str(today))))
+
+        for e in ev:
+            mins = (e["t"] - now).total_seconds() / 60.0
+            eid = e["id"]
+            # تذكير قبل الخبر بـ 15 دقيقة
+            if 0 < mins <= REMIND_MIN and eid not in st["reminded"]:
+                msgs.append((remind_text(e, mins),
+                             lambda i=eid: st["reminded"].append(i)))
+            # صدر الآن (يُتخطى لو النتيجة جاهزة فنرسل النتيجة مباشرة)
+            if (-RELEASE_WINDOW_MIN <= mins <= 0 and eid not in st["released"]
+                    and not (self.has_actual and e["actual"])):
+                msgs.append((release_text(e, self.has_actual),
+                             lambda i=eid: st["released"].append(i)))
+            # النتيجة الفعلية
+            if (self.has_actual and e["actual"] and -RESULT_WINDOW_MIN <= mins <= 0
+                    and eid not in st["results"]):
+                def mark(i=eid):
+                    st["results"].append(i)
+                    if i not in st["released"]:
+                        st["released"].append(i)
+                msgs.append((result_text(e), mark))
+
+        if not msgs:
+            return
+        # دمج رسائل نفس اللحظة في رسالة واحدة
+        text = "\n\n──────────────\n\n".join(m for m, _ in msgs)
+        if len(text) > 3800:
+            for m, mark in msgs:
+                if tg_send(m):
+                    mark()
+        elif tg_send(text):
+            for _, mark in msgs:
                 mark()
-    elif tg_send(text):
-        for _, mark in msgs:
-            mark()
 
 
 def alert_error(state, e):
@@ -315,17 +443,28 @@ def alert_error(state, e):
 def main():
     if not TG_TOKEN or not TG_CHATS:
         raise SystemExit("متغيرات بيئية ناقصة: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID")
-    state = load_state()
+    bot = NewsBot()
+    test = os.getenv("NEWS_TEST") == "1"
+    loop_min = os.getenv("NEWS_LOOP_MINUTES")
     try:
-        run(state)
+        if loop_min and not test:
+            end = time.time() + float(loop_min) * 60
+            log.info("وضع التشغيل المستمر لمدة %s دقيقة", loop_min)
+            while time.time() < end:
+                try:
+                    bot.step()
+                    save_state(bot.state)
+                except Exception as e:
+                    log.exception("خطأ في دورة الأخبار")
+                    alert_error(bot.state, e)
+                time.sleep(CHECK_SECONDS)
+        else:
+            bot.step(test=test, strict=True)
     except Exception as e:
         log.exception("خطأ في بوت الأخبار")
-        alert_error(state, e)
+        alert_error(bot.state, e)
     finally:
-        # تنظيف قوائم قديمة كي لا تكبر
-        state["reminded"] = state["reminded"][-300:]
-        state["released"] = state["released"][-300:]
-        save_state(state)
+        save_state(bot.state)
 
 
 if __name__ == "__main__":
