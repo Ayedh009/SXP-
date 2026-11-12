@@ -2,10 +2,12 @@
 """
 بوت تيليجرام لتداول SPX500 (بيانات Yahoo Finance المجانية)
 - تقرير ساعي أثناء الجلسة الأمريكية
-- تنبيهات آخر 30 و 15 دقيقة مع توقع سعر الإغلاق
+- تنبيهات الإغلاق قبل 30 و20 و15 و10 دقيقة مع توقع سعر الإغلاق واسترايك مرشح
+  (حد الميل يتدرج حسب الوقت المتبقي)
 - إشارات: Call/Put من الأوردربلوك والفجوات، وإشارة Rejection Block (RB)
 - إشارة Σ (سيغما) على فريم 5 دقائق: شمعة رفض بذيل طويل مع احتمال + نافذة زمنية + حركة متوقعة
 - درجة لكل إشارة (ضعيفة / متوسطة / قوية) من تقاطع RB و OB و FVG وخط الكنترول
+- وقف وأهداف موحدة (1R و2R) لكل الصفقات، مع تسجيل توافق الفريم الكبير وسحب السيولة
 - سحب السيولة قبل RB، تنبيه إعادة اختبار الصندوق، رسالة إلغاء، تحذير انعكاس
 - سجل صفقات + سجل توقعات الإغلاق + سجل Σ (مجلد stats) + أمر /stats + ملخص نهاية اليوم
 - تنبيه عند حدوث عطل بدل الصمت، ودمج التنبيهات المتقاربة في رسالة واحدة
@@ -48,9 +50,25 @@ SCHEDULE = [
     (9, 30, "report"), (10, 0, "report"), (11, 0, "report"),
     (12, 0, "report"), (13, 0, "report"), (14, 0, "report"),
     (15, 0, "report"),
-    (15, 30, "close30"), (15, 45, "close15"),
+    (15, 30, "close30"), (15, 40, "close20"),
+    (15, 45, "close15"), (15, 50, "close10"),
     (16, 20, "eod"),      # ملخص نهاية اليوم وتسجيل النتائج
 ]
+
+# ── تنبيهات الإغلاق: الدقائق المتبقية لكل نوع ──
+CLOSE_MIN = {"close30": 30, "close20": 20, "close15": 15, "close10": 10}
+# حد الميل (بوحدة ATR لشمعة 5 دقائق) يتدرج حسب الوقت المتبقي:
+# أقل من هذا الحد = "لا ميل واضح" بدون توصية
+CLOSE_THR = {30: 0.25, 20: 0.20, 15: 0.17, 10: 0.14}
+CLOSE_SHORT = (20, 10)     # هذه التنبيهات تُرسل بصيغة مختصرة
+STRIKE_STEP = 5            # فارق الاسترايك في عقود SPX
+
+# ── وقف وأهداف صفقات OB/FVG (مثل RB: هدفان 1R و2R) ──
+OB_STOP_ATR = 0.25         # الوقف = خلف حافة المنطقة (أو ذيل شمعة التأكيد) + 0.25 ATR
+OB_MAX_RISK_ATR = 1.2      # أقصى مسافة للوقف عن الدخول
+OB_MIN_RISK_ATR = 0.5      # أقل مسافة للوقف عن الدخول
+
+MODEL_VER = "2"            # نسخة النظام الحالي: تُسجَّل في السجلات لفصلها عن القديم
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 STATS_DIR = os.getenv("STATS_DIR", "stats")
@@ -394,18 +412,85 @@ def stamp(ns, t, label="آخر شمعة", full=True):
     return line + "\n" + second
 
 
+# ───────────────────────── الاسترايك ─────────────────────────
+def floor_k(x):
+    return int(math.floor(x / STRIKE_STEP) * STRIKE_STEP)
+
+
+def ceil_k(x):
+    return int(math.ceil(x / STRIKE_STEP) * STRIKE_STEP)
+
+
+def round_k(x):
+    return int(round(x / STRIKE_STEP) * STRIKE_STEP)
+
+
+def strike_levels(side, price, pred, a, minutes_left):
+    """ثلاثة استرايكات لعقد ينتهي بالإغلاق:
+    آمن  = داخل المال بمقدار نصف الحركة المتوقعة المتبقية
+    متوازن = عند السعر تقريباً (أول استرايك داخل المال)
+    جريء = خارج المال عند سعر الإغلاق المتوقع"""
+    sigma = a * math.sqrt(max(minutes_left / 5.0, 1.0))
+    if side == "CALL":
+        mid = floor_k(price)
+        return {"safe": floor_k(price - 0.5 * sigma), "mid": mid,
+                "bold": max(mid + STRIKE_STEP, round_k(pred))}
+    mid = ceil_k(price)
+    return {"safe": ceil_k(price + 0.5 * sigma), "mid": mid,
+            "bold": min(mid - STRIKE_STEP, round_k(pred))}
+
+
+def strike_lines(side, price, ks):
+    def rel(k):
+        itm = (k < price) if side == "CALL" else (k > price)
+        return f"{'داخل المال' if itm else 'خارج المال'} {abs(price - k):.1f} نقطة"
+    nm = "كول" if side == "CALL" else "بوت"
+    return [f"🎯 الاسترايك المرشح ({nm} — عقد ينتهي بالإغلاق):",
+            f"• آمن: {ks['safe']} ({rel(ks['safe'])})",
+            f"• متوازن ⭐: {ks['mid']} ({rel(ks['mid'])})",
+            f"• جريء: {ks['bold']} ({rel(ks['bold'])})",
+            "ℹ️ سعر العقد غير متاح من المصدر المجاني؛ قارنه في منصتك قبل الدخول."]
+
+
+def strike_pays(side, final, k):
+    """هل كان العقد سينتهي رابحاً عند الإغلاق؟"""
+    return final > k if side == "CALL" else final < k
+
+
 # ───────────────────────── السجلات (CSV) ─────────────────────────
 TRADE_HEADER = ["date", "open_time_ny", "close_time_ny", "side", "kind", "score",
-                "entry", "stop", "tp1", "tp2", "exit", "result", "r_multiple"]
+                "entry", "stop", "tp1", "tp2", "exit", "result", "r_multiple",
+                "ver", "htf", "sweep"]
 PRED_HEADER = ["date", "alert", "alert_time_ny", "price", "predicted", "side",
-               "final_close", "result"]
+               "final_close", "result", "ver", "k_safe", "k_mid", "k_bold",
+               "pay_safe", "pay_mid", "pay_bold"]
 SIGMA_HEADER = ["date", "time_ny", "side", "entry", "target", "prob", "exp_move",
                 "win_lo_min", "win_hi_min", "score", "sweep", "result"]
+
+
+def _upgrade_csv(path, header):
+    """لو السجل القديم رأسه مختلف: يُعاد كتابته بالرأس الجديد (الأعمدة الجديدة فارغة)."""
+    with open(path, encoding="utf-8", newline="") as fh:
+        rows = list(csv.reader(fh))
+    if not rows:
+        os.remove(path)
+        return
+    if rows[0] == header:
+        return
+    old = rows[0]
+    out = [header]
+    for r in rows[1:]:
+        d = dict(zip(old, r))
+        out.append([d.get(h, "") for h in header])
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        csv.writer(fh).writerows(out)
 
 
 def csv_append(path, header, row):
     try:
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        if os.path.exists(path):
+            _upgrade_csv(path, header)
         new = not os.path.exists(path)
         with open(path, "a", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
@@ -439,9 +524,27 @@ def _dec(d, keys):
     return out
 
 
-RESULT_AR = {"TP2": "حقق الهدف الثاني ✅", "TP1_BE": "حقق الهدف الأول ثم خرج عند الدخول ✅",
+def _fl(x):
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def _tally(rows):
+    w = sum(1 for t in rows if t.get("result") == "TP2")
+    be = sum(1 for t in rows if t.get("result") == "TP1_BE")
+    sl = sum(1 for t in rows if t.get("result") == "SL")
+    return w, be, sl
+
+
+def _fmt_tally(rows):
+    w, be, sl = _tally(rows)
+    return f"{w}✅ {be}↩️ {sl}❌"
+
+
+RESULT_AR = {"TP2": "حقق الهدف الثاني ✅", "TP1_BE": "حقق الهدف الأول ثم خرج عند الدخول ↩️ (0R)",
              "SL": "ضُرب الوقف ❌", "EOD": "أُغلقت بنهاية الجلسة ⏹"}
-WIN_RESULTS = ("TP2", "TP1_BE")
 SIGMA_RESULT_AR = {"HIT": "حققت الحركة المتوقعة ✅", "MISS": "لم تحقق الحركة في النافذة ❌",
                    "EOD": "انتهت الجلسة قبل الحسم ⏹"}
 
@@ -682,7 +785,7 @@ class Bot:
         L += ["", stamp(ns, ns.last_t, "آخر شمعة في البيانات")]
         return "\n".join(L)
 
-    # ---- تنبيهات آخر 30 / 15 دقيقة ----
+    # ---- تنبيهات الإغلاق (30 / 20 / 15 / 10 دقيقة) ----
     def close_text(self, ns, minutes_left):
         last6 = [c.c for c in ns.closed if c.t.date() == ns.now.date()][-6:]
         s = slope(last6)
@@ -699,29 +802,54 @@ class Bot:
         else:
             direction = "عرضي ⚪"
         diff = pred - ns.price
-        if diff > 0.15 * ns.atr5:
+        min_diff = CLOSE_THR.get(minutes_left, 0.17) * ns.atr5   # الحد المتدرج
+        if diff > min_diff:
             rec, side = "CALL 🟢", "CALL"
-        elif diff < -0.15 * ns.atr5:
+        elif diff < -min_diff:
             rec, side = "PUT 🔴", "PUT"
         else:
             rec, side = "لا ميل واضح — يُفضّل الانتظار ⚪", "NONE"
 
-        L = [
-            f"⚡ تنبيه الإغلاق — باقي {minutes_left} دقيقة",
-            "━━━━━━━━━━━━━━",
-            f"السعر الحالي: {f(ns.price)}",
-            f"الاتجاه الأخير (زخم آخر 30 دقيقة): {direction}",
-            f"السعر مقابل VWAP: {'فوقه' if ns.price > ns.vwap else 'تحته'} ({f(ns.vwap)})",
-            f"السعر المتوقع للإغلاق: {f(pred)}  ({diff:+.2f} نقطة)",
-            f"أقرب سيولة: قمة اليوم {f(ns.day_high)} | قاع اليوم {f(ns.day_low)}",
-            f"توصية عقد الربع ساعة الأخيرة: {rec}",
-            "",
-            stamp(ns, ns.last_t, "آخر شمعة في البيانات"),
-            "",
-            "⚠️ هذا تقدير إحصائي مبني على الزخم والسيولة وليس توقعاً مضموناً.",
-        ]
+        ks = None
+        if side != "NONE":
+            ks = strike_levels(side, ns.price, pred, ns.atr5, minutes_left)
+
+        if minutes_left in CLOSE_SHORT:
+            L = [
+                f"⚡ تنبيه الإغلاق — باقي {minutes_left} دقيقة",
+                "━━━━━━━━━━━━━━",
+                f"السعر الحالي: {f(ns.price)}",
+                f"المتوقع للإغلاق: {f(pred)} ({diff:+.2f} نقطة)",
+                f"التوصية: {rec}",
+            ]
+            if ks:
+                L += [""] + strike_lines(side, ns.price, ks)
+            L += ["", stamp(ns, ns.last_t, "آخر شمعة في البيانات", full=False),
+                  "⚠️ تقدير إحصائي وليس نصيحة مالية."]
+        else:
+            L = [
+                f"⚡ تنبيه الإغلاق — باقي {minutes_left} دقيقة",
+                "━━━━━━━━━━━━━━",
+                f"السعر الحالي: {f(ns.price)}",
+                f"الاتجاه الأخير (زخم آخر 30 دقيقة): {direction}",
+                f"السعر مقابل VWAP: {'فوقه' if ns.price > ns.vwap else 'تحته'} ({f(ns.vwap)})",
+                f"السعر المتوقع للإغلاق: {f(pred)}  ({diff:+.2f} نقطة)",
+                f"أقرب سيولة: قمة اليوم {f(ns.day_high)} | قاع اليوم {f(ns.day_low)}",
+                f"التوصية: {rec}",
+            ]
+            if ks:
+                L += [""] + strike_lines(side, ns.price, ks)
+            L += [
+                "",
+                stamp(ns, ns.last_t, "آخر شمعة في البيانات"),
+                "",
+                "⚠️ هذا تقدير إحصائي مبني على الزخم والسيولة وليس توقعاً مضموناً.",
+            ]
         info = {"alert": str(minutes_left), "t": ns.now, "price": ns.price,
-                "pred": pred, "side": side}
+                "pred": pred, "side": side,
+                "k_safe": ks["safe"] if ks else None,
+                "k_mid": ks["mid"] if ks else None,
+                "k_bold": ks["bold"] if ks else None}
         return "\n".join(L), info
 
     # ---- الدرجة: تقاطع RB و OB و FVG وخط الكنترول مع نطاق الإشارة ----
@@ -818,11 +946,13 @@ class Bot:
                 break
 
     # ---- الصفقات ----
-    def add_trade(self, side, kind, score, entry, sl, tp1, tp2, t, ref, box=None):
+    def add_trade(self, side, kind, score, entry, sl, tp1, tp2, t, ref, box=None,
+                  htf=0, sweep=False):
         self.count += 1
         tr = {"side": side, "kind": kind, "score": score, "entry": entry,
               "sl": sl, "sl0": sl, "risk": abs(entry - sl) or 1.0,
               "tp1": tp1, "tp2": tp2, "from": t, "ref": ref, "box": box,
+              "htf": int(htf), "sweep": bool(sweep),
               "tp1_hit": False, "done": False, "warned": False}
         self.trades.append(tr)
         return tr
@@ -837,7 +967,8 @@ class Bot:
             tr["from"].strftime("%Y-%m-%d"), tr["from"].strftime("%H:%M"),
             t.astimezone(NY).strftime("%H:%M"), tr["side"], tr["kind"], tr["score"],
             f"{tr['entry']:.2f}", f"{tr['sl0']:.2f}", f"{tr['tp1']:.2f}",
-            f"{tr['tp2']:.2f}", f"{exit_price:.2f}", result, f"{r:.2f}"])
+            f"{tr['tp2']:.2f}", f"{exit_price:.2f}", result, f"{r:.2f}",
+            MODEL_VER, tr.get("htf", 0), "1" if tr.get("sweep") else "0"])
 
     def check_rb(self, ns):
         """إشارة Rejection Block: شمعة رفض (ذيل طويل عند قاع/قمة محلية)
@@ -878,8 +1009,10 @@ class Bot:
             sgn = 1 if up else -1
             tp1, tp2 = entry + sgn * risk, entry + sgn * 2 * risk
             tside = "CALL" if up else "PUT"
+            htf_v = ns.bias1h if up else -ns.bias1h
             self.add_trade(tside, "RB", score, entry, sl, tp1, tp2, conf.t,
-                           ref=bot if up else top, box=key)
+                           ref=bot if up else top, box=key,
+                           htf=htf_v, sweep=bool(sw))
 
             rng = rej.h - rej.l
             if up:
@@ -1085,34 +1218,45 @@ class Bot:
         if last and (k.t - last) < timedelta(minutes=SIGNAL_COOLDOWN_MIN):
             return
         a = ns.atr5
-        recent = ns.closed[-3:]
         entry = k.c
-        if side == "CALL":
-            sl = min(z.lo, min(c.l for c in recent)) - 0.1 * a
-            sl = max(sl, entry - 1.5 * a * 2)
-            tp1, tp2 = entry + 1.0 * a * 2, entry + 1.8 * a * 2
+        long = side == "CALL"
+        # الوقف خلف حافة المنطقة (أو ذيل شمعة التأكيد) + 0.25 ATR، بين 0.5 و1.2 ATR
+        if long:
+            sl = min(z.lo, k.l) - OB_STOP_ATR * a
+            sl = min(sl, entry - OB_MIN_RISK_ATR * a)
+            sl = max(sl, entry - OB_MAX_RISK_ATR * a)
             ref = z.lo
         else:
-            sl = max(z.hi, max(c.h for c in recent)) + 0.1 * a
-            sl = min(sl, entry + 1.5 * a * 2)
-            tp1, tp2 = entry - 1.0 * a * 2, entry - 1.8 * a * 2
+            sl = max(z.hi, k.h) + OB_STOP_ATR * a
+            sl = max(sl, entry + OB_MIN_RISK_ATR * a)
+            sl = min(sl, entry + OB_MAX_RISK_ATR * a)
             ref = z.hi
+        risk = abs(entry - sl)
+        sgn = 1 if long else -1
+        tp1, tp2 = entry + sgn * risk, entry + sgn * 2 * risk   # 1R و 2R مثل RB
+
         self.signaled.add(z.id)
         self.last_signal[side] = k.t
         score, fl = self.confluence(ns, z.lo, z.hi, z.bullish)
-        self.add_trade(side, z.kind, score, entry, sl, tp1, tp2, k.t, ref=ref)
-        htf = ns.bias1h if side == "CALL" else -ns.bias1h
+        sw = sweep_info(ns.closed, len(ns.closed) - 1, ns.prev_high, ns.prev_low,
+                        "UP" if long else "DOWN")
+        htf = ns.bias1h if long else -ns.bias1h
+        self.add_trade(side, z.kind, score, entry, sl, tp1, tp2, k.t, ref=ref,
+                       htf=htf, sweep=bool(sw))
         htf_txt = ("متوافقة مع الفريم الكبير ✅" if htf > 0 else
                    "عكس الفريم الكبير ⚠️ (صفقة ارتداد)" if htf < 0 else
                    "الفريم الكبير محايد")
-        emoji = "🟢" if side == "CALL" else "🔴"
+        sweep_txt = (f"💧 سحب سيولة ({sw[0]} عند {f(sw[1])})" if sw
+                     else "💧 بدون سحب سيولة")
+        emoji = "🟢" if long else "🔴"
         self.q(
             f"🚨 إشارة {side} {emoji}\n━━━━━━━━━━━━━━\n"
             f"⭐ الدرجة: {strength(score)} ({score}/4)\n"
-            f"{flags_text(fl)}\n\n"
+            f"{flags_text(fl)}\n"
+            f"{sweep_txt}\n\n"
             f"السبب: ارتداد من {z.name} ({f(z.lo)} – {f(z.hi)}) مع إغلاق شمعة مؤكد\n"
             f"سعر الدخول: {f(entry)}\nوقف الخسارة: {f(sl)}\n"
-            f"الهدف الأول TP1: {f(tp1)}\nالهدف الثاني TP2: {f(tp2)}\n"
+            f"الهدف الأول TP1 (1R): {f(tp1)}\nالهدف الثاني TP2 (2R): {f(tp2)}\n"
             f"{htf_txt}\n\n"
             f"{stamp(ns, k.t, 'شمعة التأكيد')}\n"
             f"🧱 {z.name} على شمعة: {hm(z.t)} نيويورك\n"
@@ -1200,15 +1344,16 @@ class Bot:
             if not s["done"]:
                 self.finish_sigma(s, "EOD", ns.now)
 
-        wins = [t for t in self.trades if t.get("result") in WIN_RESULTS]
+        wins = [t for t in self.trades if t.get("result") == "TP2"]
+        bes = [t for t in self.trades if t.get("result") == "TP1_BE"]
         losses = [t for t in self.trades if t.get("result") == "SL"]
         eod = [t for t in self.trades if t.get("result") == "EOD"]
         total_r = sum(t.get("r", 0) for t in self.trades)
         L = [f"📋 ملخص نهاية اليوم — {ns.now.strftime('%Y-%m-%d')}",
              "━━━━━━━━━━━━━━",
              f"إغلاق SPX: {f(final)}", "",
-             f"🔹 الصفقات: {len(self.trades)} | رابحة {len(wins)} | خاسرة {len(losses)} "
-             f"| أُغلقت بنهاية الجلسة {len(eod)}",
+             f"🔹 الصفقات: {len(self.trades)} | هدف ثانٍ {len(wins)} | تعادل بعد الأول {len(bes)} "
+             f"| وقف {len(losses)} | نهاية الجلسة {len(eod)}",
              f"مجموع النتيجة: {total_r:+.2f}R"]
         for t in self.trades:
             L.append(f"• {t['side']} {t.get('kind', '')} (درجة {t.get('score', '-')}) "
@@ -1223,26 +1368,46 @@ class Bot:
                 L.append(f"• Σ {s['side']} {hm(s['t0'] - timedelta(minutes=5))} "
                          f"({s['prob']}% — متوقع {s['exp']:g}$) → "
                          f"{SIGMA_RESULT_AR.get(s['result'], '-')}")
-        L += ["", "🔹 توقعات الإغلاق"]
+        L += ["", "🔹 توقعات الإغلاق (الاتجاه: الإغلاق مقابل سعر التنبيه)"]
         if not self.preds:
             L.append("لا توجد توقعات مسجلة اليوم.")
         pts = 0
         scored = 0
         for p in self.preds:
             if p["side"] == "CALL":
-                res = "WIN" if final >= p["pred"] else "LOSS"
+                res = "WIN" if final > p["price"] else "LOSS"
             elif p["side"] == "PUT":
-                res = "WIN" if final <= p["pred"] else "LOSS"
+                res = "WIN" if final < p["price"] else "LOSS"
             else:
                 res = "NONE"
             if res != "NONE":
                 scored += 1
                 pts += res == "WIN"
+
+            pay = {}
+            for key in ("safe", "mid", "bold"):
+                kv = p.get(f"k_{key}")
+                if kv is None or p["side"] == "NONE":
+                    pay[key] = ""
+                else:
+                    pay[key] = "1" if strike_pays(p["side"], final, kv) else "0"
+
             csv_append(PRED_CSV, PRED_HEADER, [
                 ns.now.strftime("%Y-%m-%d"), p["alert"], p["t"].strftime("%H:%M"),
-                f"{p['price']:.2f}", f"{p['pred']:.2f}", p["side"], f"{final:.2f}", res])
-            res_ar = {"WIN": "نقطة ✅", "LOSS": "خسارة ❌", "NONE": "بدون توصية ⚪"}[res]
-            L.append(f"• قبل {p['alert']} د: {p['side']} — المتوقع {f(p['pred'])} → {res_ar}")
+                f"{p['price']:.2f}", f"{p['pred']:.2f}", p["side"], f"{final:.2f}", res,
+                MODEL_VER,
+                p.get("k_safe") if p.get("k_safe") is not None else "",
+                p.get("k_mid") if p.get("k_mid") is not None else "",
+                p.get("k_bold") if p.get("k_bold") is not None else "",
+                pay["safe"], pay["mid"], pay["bold"]])
+
+            res_ar = {"WIN": "اتجاه صحيح ✅", "LOSS": "اتجاه خاطئ ❌",
+                      "NONE": "بدون توصية ⚪"}[res]
+            line = (f"• قبل {p['alert']} د: {p['side']} — من {f(p['price'])} "
+                    f"(المتوقع {f(p['pred'])}) → {res_ar}")
+            if res != "NONE" and p.get("k_mid") is not None:
+                line += " | استرايك متوازن " + ("ربح ✅" if pay["mid"] == "1" else "خسارة ❌")
+            L.append(line)
         if scored:
             L.append(f"النتيجة: {pts} من {scored}")
         L += ["", "للإحصائيات التراكمية أرسل /stats"]
@@ -1256,31 +1421,52 @@ class Bot:
         L = ["📈 إحصائيات البوت (من السجلات المحفوظة)", "━━━━━━━━━━━━━━"]
         if not trades and not preds and not sigs:
             L.append("لا توجد سجلات بعد؛ تُسجل النتائج بعد نهاية كل يوم تداول.")
+
+        # ── الصفقات: النظام الجديد منفصل عن القديم ──
         if trades:
-            w = [t for t in trades if t["result"] in WIN_RESULTS]
-            l = [t for t in trades if t["result"] == "SL"]
-            e = [t for t in trades if t["result"] == "EOD"]
-            closed = len(w) + len(l)
-            rate = f"{len(w) / closed * 100:.0f}%" if closed else "—"
-            tr_r = sum(float(t["r_multiple"]) for t in trades)
-            days = len({t["date"] for t in trades})
-            L += [f"🔹 الصفقات ({days} يوم): {len(trades)}",
-                  f"رابحة {len(w)} | خاسرة {len(l)} | نهاية الجلسة {len(e)}",
-                  f"نسبة النجاح (رابحة ÷ رابحة+خاسرة): {rate}",
-                  f"مجموع النتيجة: {tr_r:+.2f}R"]
-            by = {}
-            for t in trades:
-                d = by.setdefault(t["kind"], [0, 0])
-                d[0] += t["result"] in WIN_RESULTS
-                d[1] += t["result"] == "SL"
-            L.append("حسب النوع: " + " | ".join(f"{k}: {v[0]}✅/{v[1]}❌" for k, v in by.items()))
-            by = {}
-            for t in trades:
-                d = by.setdefault(t["score"], [0, 0])
-                d[0] += t["result"] in WIN_RESULTS
-                d[1] += t["result"] == "SL"
-            L.append("حسب الدرجة: " + " | ".join(
-                f"{k}: {v[0]}✅/{v[1]}❌" for k, v in sorted(by.items())))
+            new_t = [t for t in trades if (t.get("ver") or "") == MODEL_VER]
+            old_t = [t for t in trades if (t.get("ver") or "") != MODEL_VER]
+            if old_t:
+                old_r = sum(_fl(t.get("r_multiple")) for t in old_t)
+                L.append(f"🗂 النظام القديم (وقف واسع): {len(old_t)} صفقة | "
+                         f"{old_r:+.2f}R — لا يُقارن بالجديد")
+            if new_t:
+                w, be, sl = _tally(new_t)
+                e = sum(1 for t in new_t if t.get("result") == "EOD")
+                decided = w + be + sl
+                tr_r = sum(_fl(t.get("r_multiple")) for t in new_t)
+                days = len({t.get("date") for t in new_t})
+                L += ["", f"🔹 الصفقات — النظام الجديد ({days} يوم): {len(new_t)}",
+                      f"هدف ثانٍ {w}✅ | تعادل بعد الأول {be}↩️ | وقف {sl}❌ | نهاية الجلسة {e}⏹"]
+                if decided:
+                    L.append(f"بلوغ الهدف الثاني: {w / decided * 100:.0f}% | "
+                             f"لم تخسر: {(w + be) / decided * 100:.0f}%")
+                L.append(f"مجموع النتيجة: {tr_r:+.2f}R")
+
+                by = {}
+                for t in new_t:
+                    by.setdefault(t.get("kind", "?"), []).append(t)
+                L.append("حسب النوع: " + " | ".join(
+                    f"{k}: {_fmt_tally(v)}" for k, v in by.items()))
+                by = {}
+                for t in new_t:
+                    by.setdefault(t.get("score", "?"), []).append(t)
+                L.append("حسب الدرجة: " + " | ".join(
+                    f"{k}: {_fmt_tally(v)}" for k, v in sorted(by.items())))
+
+                ha = [t for t in new_t if t.get("htf") == "1"]
+                hb = [t for t in new_t if t.get("htf") == "-1"]
+                hn = [t for t in new_t if t.get("htf") == "0"]
+                L.append(f"الفريم الكبير: معه {_fmt_tally(ha)} | عكسه {_fmt_tally(hb)} "
+                         f"| محايد {_fmt_tally(hn)}")
+                sa = [t for t in new_t if t.get("sweep") == "1"]
+                sb = [t for t in new_t if t.get("sweep") == "0"]
+                L.append(f"سحب السيولة: معه {_fmt_tally(sa)} | بدونه {_fmt_tally(sb)}")
+                L.append("الرموز: ✅ هدف ثانٍ | ↩️ تعادل | ❌ وقف")
+            else:
+                L += ["", "🔹 لا توجد صفقات بالنظام الجديد بعد."]
+
+        # ── إشارات Σ ──
         if sigs:
             sc = [s for s in sigs if s["result"] in ("HIT", "MISS")]
             ok = [s for s in sc if s["result"] == "HIT"]
@@ -1303,15 +1489,37 @@ class Bot:
                     o3 = [s for s in s3 if s["result"] == "HIT"]
                     if s3:
                         L.append(f"احتمال {lo_p}–{hi_p}%: {len(o3)} من {len(s3)}")
+
+        # ── توقعات الإغلاق: الجديد (بالاتجاه) منفصل عن القديم ──
         if preds:
-            sc = [p for p in preds if p["result"] in ("WIN", "LOSS")]
-            ok = [p for p in sc if p["result"] == "WIN"]
-            L += ["", f"🔹 توقعات الإغلاق: {len(ok)} نقطة من {len(sc)}"]
-            for a in ("30", "15"):
-                s2 = [p for p in sc if p["alert"] == a]
-                o2 = [p for p in s2 if p["result"] == "WIN"]
-                if s2:
-                    L.append(f"تنبيه {a} دقيقة: {len(o2)} من {len(s2)}")
+            new_p = [p for p in preds if (p.get("ver") or "") == MODEL_VER]
+            old_p = [p for p in preds if (p.get("ver") or "") != MODEL_VER]
+            if old_p:
+                osc = [p for p in old_p if p.get("result") in ("WIN", "LOSS")]
+                ook = [p for p in osc if p.get("result") == "WIN"]
+                L += ["", f"🗂 توقعات النظام القديم: {len(ook)} من {len(osc)} — لا تُقارن"]
+            if new_p:
+                sc = [p for p in new_p if p.get("result") in ("WIN", "LOSS")]
+                ok = [p for p in sc if p.get("result") == "WIN"]
+                days = len({p.get("date") for p in new_p})
+                L += ["", f"🔹 توقعات الإغلاق — الجديد ({days} يوم): اتجاه صحيح "
+                          f"{len(ok)} من {len(sc)}"]
+                parts = []
+                for a_ in ("30", "20", "15", "10"):
+                    s2 = [p for p in sc if p.get("alert") == a_]
+                    o2 = [p for p in s2 if p.get("result") == "WIN"]
+                    if s2:
+                        parts.append(f"{a_}د: {len(o2)} من {len(s2)}")
+                if parts:
+                    L.append("حسب التوقيت: " + " | ".join(parts))
+                parts = []
+                for key, nm in (("safe", "آمن"), ("mid", "متوازن"), ("bold", "جريء")):
+                    rows = [p for p in sc if p.get(f"pay_{key}") in ("0", "1")]
+                    paid = [p for p in rows if p.get(f"pay_{key}") == "1"]
+                    if rows:
+                        parts.append(f"{nm}: ربح {len(paid)} من {len(rows)}")
+                if parts:
+                    L.append("الاسترايك: " + " | ".join(parts))
         today_open = [t for t in self.trades if not t["done"]]
         if today_open:
             L += ["", f"صفقات مفتوحة الآن: {len(today_open)}"]
@@ -1347,7 +1555,7 @@ class Bot:
                     if kind == "report":
                         tg_send(self.report_text(ns))
                     else:
-                        text, info = self.close_text(ns, 30 if kind == "close30" else 15)
+                        text, info = self.close_text(ns, CLOSE_MIN[kind])
                         self.preds.append(info)
                         tg_send(text)
 
