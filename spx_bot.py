@@ -5,9 +5,12 @@
 - تنبيهات الإغلاق قبل 30 و20 و15 و10 دقيقة مع توقع سعر الإغلاق واسترايك مرشح
   (حد الميل يتدرج حسب الوقت المتبقي)
 - إشارات: Call/Put من الأوردربلوك والفجوات، وإشارة Rejection Block (RB)
+- إشارة اختراق الشمعة الأولى (9:30-9:35): إغلاق شمعة 5 دقائق فوق القمة = كول، تحت القاع = بوت
+- سياق QQQ و SPY مع كل إشارة (حتى الفجوات): نسبة التغير + نصيحة كول/بوت/محايد (تنبيه فقط ولا يلغي أي إشارة)
+  + إشعار فوري عند تغير اتجاه أحدهما أو تغير الحالة العامة
 - إشارة Σ (سيغما) على فريم 5 دقائق: شمعة رفض بذيل طويل مع احتمال + نافذة زمنية + حركة متوقعة
 - درجة لكل إشارة (ضعيفة / متوسطة / قوية) من تقاطع RB و OB و FVG وخط الكنترول
-- وقف وأهداف موحدة (1R و2R) لكل الصفقات، مع تسجيل توافق الفريم الكبير وسحب السيولة
+- وقف وأهداف موحدة (1R و2R) لكل الصفقات، مع تسجيل توافق الفريم الكبير وسحب السيولة وQQQ/SPY
 - سحب السيولة قبل RB، تنبيه إعادة اختبار الصندوق، رسالة إلغاء، تحذير انعكاس
 - سجل صفقات + سجل توقعات الإغلاق + سجل Σ (مجلد stats) + أمر /stats + ملخص نهاية اليوم
 - تنبيه عند حدوث عطل بدل الصمت، ودمج التنبيهات المتقاربة في رسالة واحدة
@@ -92,6 +95,16 @@ RB_MIN_RISK_ATR = 0.5      # أقل مسافة للوقف عن الدخول = 0.
 SIGMA_ENABLED = True
 SIGMA_MIN_PROB = 45        # لا تُرسل الإشارة لو الاحتمال التقديري أقل من هذا الرقم
 SIGMA_MAX_PROB = 85        # سقف الاحتمال المعروض
+
+# ── إعدادات اختراق الشمعة الأولى (ORB) ──
+ORB_ENABLED = True         # False لإيقاف الإشارة
+
+# ── إعدادات سياق QQQ و SPY ──
+CTX_ENABLED = True         # False لإيقاف إضافة QQQ/SPY للرسائل
+CTX_SYMBOLS = ("QQQ", "SPY")
+CTX_CACHE_SEC = 60         # تحديث نسب QQQ/SPY كل دقيقة تقريباً
+CTX_DEADBAND = 0.03        # أقل من ±0.03% لا يغيّر اتجاه السهم (لمنع الإشعارات المتكررة)
+CTX_CHANGE_ALERT = True    # إشعار عند تغير اتجاه QQQ أو SPY
 
 TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
@@ -412,6 +425,32 @@ def stamp(ns, t, label="آخر شمعة", full=True):
     return line + "\n" + second
 
 
+# ───────────────────────── سياق QQQ و SPY ─────────────────────────
+def _sgn(prev, v):
+    """اتجاه السهم مع منطقة حياد: داخل ±CTX_DEADBAND يبقى الاتجاه السابق."""
+    if v > CTX_DEADBAND:
+        return 1
+    if v < -CTX_DEADBAND:
+        return -1
+    return prev
+
+
+def ctx_dir_text(d):
+    return {1: "صاعد 🟢", -1: "هابط 🔴", 0: "محايد / متذبذب ⚪"}[d]
+
+
+def ctx_word(s):
+    return {1: "صاعد 🟢", -1: "هابط 🔴", 0: "محايد ⚪"}[s]
+
+
+def ctx_advice(d):
+    if d == 1:
+        return "💡 النصيحة: كول 🟢 — وتجنب البوت"
+    if d == -1:
+        return "💡 النصيحة: بوت 🔴 — وتجنب الكول"
+    return "💡 النصيحة: محايد ⚪ (متذبذب) — QQQ و SPY غير متفقين أو شبه ثابتين"
+
+
 # ───────────────────────── الاسترايك ─────────────────────────
 def floor_k(x):
     return int(math.floor(x / STRIKE_STEP) * STRIKE_STEP)
@@ -460,7 +499,7 @@ def strike_pays(side, final, k):
 # ───────────────────────── السجلات (CSV) ─────────────────────────
 TRADE_HEADER = ["date", "open_time_ny", "close_time_ny", "side", "kind", "score",
                 "entry", "stop", "tp1", "tp2", "exit", "result", "r_multiple",
-                "ver", "htf", "sweep"]
+                "ver", "htf", "sweep", "mkt"]
 PRED_HEADER = ["date", "alert", "alert_time_ny", "price", "predicted", "side",
                "final_close", "result", "ver", "k_safe", "k_mid", "k_bold",
                "pay_safe", "pay_mid", "pay_bold"]
@@ -565,6 +604,11 @@ class Bot:
         self.rb_boxes = []
         self.sigma_seen = set()
         self.sigmas = []
+        self.orb_seen = set()
+        self.ctx = None          # آخر نسب QQQ/SPY
+        self.ctx_t = 0
+        self.ctx_fail_t = 0
+        self.ctx_sign = {}       # اتجاه كل سهم عند آخر فحص (لإشعار التغير)
         self.preds = []
         self.last_signal = {}
         self.trades = []
@@ -587,6 +631,8 @@ class Bot:
                 "rb_boxes": [_enc(b) for b in self.rb_boxes],
                 "sigma_seen": list(self.sigma_seen),
                 "sigmas": [_enc(s) for s in self.sigmas],
+                "orb_seen": list(self.orb_seen),
+                "ctx_sign": dict(self.ctx_sign),
                 "preds": [_enc(p) for p in self.preds],
                 "last_signal": {k: v.isoformat() for k, v in self.last_signal.items()},
                 "trades": [_enc(tr) for tr in self.trades],
@@ -614,6 +660,8 @@ class Bot:
             self.rb_boxes = [_dec(b, ["rej_t", "conf_t"]) for b in d.get("rb_boxes", [])]
             self.sigma_seen = set(d.get("sigma_seen", []))
             self.sigmas = [_dec(s, ["t0"]) for s in d.get("sigmas", [])]
+            self.orb_seen = set(d.get("orb_seen", []))
+            self.ctx_sign = dict(d.get("ctx_sign", {}))
             self.preds = [_dec(p, ["t"]) for p in d.get("preds", [])]
             self.last_signal = {k: datetime.fromisoformat(v) for k, v in d["last_signal"].items()}
             self.trades = [_dec(tr, ["from"]) for tr in d["trades"]]
@@ -672,6 +720,107 @@ class Bot:
         self.heavy, self.heavy_t = h, time.time()
         return h
 
+    # ---- سياق QQQ و SPY ----
+    def market_ctx(self):
+        """نسبة تغير QQQ و SPY عن إغلاق أمس + الاتجاه العام.
+        الاتجاه العام: كلاهما صاعد = كول، كلاهما هابط = بوت، غير ذلك = محايد/متذبذب.
+        يُحدَّث كل CTX_CACHE_SEC ثانية، وعند الفشل يُستخدم آخر قيمة (حتى 15 دقيقة)."""
+        now_t = time.time()
+        if self.ctx and now_t - self.ctx_t < CTX_CACHE_SEC:
+            return self.ctx
+        stale_ok = self.ctx if (self.ctx and now_t - self.ctx_t < 900) else None
+        if now_t - self.ctx_fail_t < 120:       # لا نكرر المحاولة الفاشلة كل دورة
+            return stale_ok
+        try:
+            today = datetime.now(NY).date()
+            chg = {}
+            for sym in CTX_SYMBOLS:
+                cs = self.api.candles(sym, "DAY", 3)
+                if len(cs) < 2 or cs[-1].t.date() != today or not cs[-2].c:
+                    raise RuntimeError(f"بيانات {sym} اليومية غير مكتملة")
+                chg[sym] = (cs[-1].c - cs[-2].c) / cs[-2].c * 100.0
+        except Exception as e:
+            self.ctx_fail_t = now_t
+            log.warning("تعذر جلب QQQ/SPY: %s", e)
+            return stale_ok
+        qv, sv = chg["QQQ"], chg["SPY"]
+        qs = _sgn(self.ctx_sign.get("QQQ", 0), qv)
+        ss = _sgn(self.ctx_sign.get("SPY", 0), sv)
+        d = qs if (qs == ss and qs != 0) else 0
+        lead = None
+        if d == 1:
+            lead = "QQQ" if qv >= sv else "SPY"
+        elif d == -1:
+            lead = "QQQ" if qv <= sv else "SPY"
+        self.ctx = {"q": qv, "s": sv, "qs": qs, "ss": ss, "dir": d, "lead": lead}
+        self.ctx_t = now_t
+        return self.ctx
+
+    def ctx_block(self, ns, side=None, compact=False):
+        """نص QQQ/SPY يُضاف للإشارة. side = CALL أو PUT (أو None لنص بدون مقارنة).
+        يرجع نصاً يبدأ بسطر جديد، أو نصاً فارغاً لو البيانات غير متاحة.
+        تنبيه فقط: لا يلغي الإشارة ولا يمنعها."""
+        c = getattr(ns, "ctx", None)
+        if not c:
+            return ""
+        d = c["dir"]
+        want = {"CALL": 1, "PUT": -1}.get(side, 0)
+        head = f"🌐 QQQ {c['q']:+.2f}% | SPY {c['s']:+.2f}%"
+        if compact:
+            short = {1: "كول 🟢", -1: "بوت 🔴", 0: "محايد ⚪"}[d]
+            mark = "" if (d == 0 or want == 0) else ("✅" if want == d else "⚠️")
+            return ("\n" + f"{head} → {short} {mark}").rstrip()
+        lead = ""
+        if d == 1:
+            lead = f" — {c['lead']} يقود الصعود"
+        elif d == -1:
+            lead = f" — {c['lead']} يقود الهبوط"
+        lines = [head, f"الاتجاه العام: {ctx_dir_text(d)}{lead}", ctx_advice(d)]
+        if want != 0:
+            if d == 0:
+                lines.append("⚪ لا تأكيد من QQQ/SPY لهذه الإشارة")
+            elif want == d:
+                lines.append("✅ الإشارة متوافقة مع اتجاه QQQ/SPY")
+            else:
+                lines.append("⚠️ الإشارة عكس اتجاه QQQ/SPY — تنبيه فقط، الإشارة سارية")
+        return "\n" + "\n".join(lines)
+
+    def mkt_align(self, ns, side):
+        """1 = الصفقة مع اتجاه QQQ/SPY، -1 = عكسه، 0 = محايد، None = غير متاح (للسجل)."""
+        c = getattr(ns, "ctx", None)
+        if not c:
+            return None
+        want = 1 if side == "CALL" else -1
+        return c["dir"] * want
+
+    def check_ctx_change(self, ns):
+        """إشعار عند: تحوّل QQQ أو SPY من صاعد إلى هابط (أو العكس)،
+        أو تغير الحالة العامة (كول / بوت / محايد)."""
+        c = getattr(ns, "ctx", None)
+        if not c or not CTX_CHANGE_ALERT:
+            return
+        new = {"QQQ": c["qs"], "SPY": c["ss"]}
+        old = self.ctx_sign
+        self.ctx_sign = new
+        if not old:          # أول قراءة في اليوم: نسجّلها بصمت
+            return
+        flips = [n for n in ("QQQ", "SPY") if old.get(n, 0) * new[n] == -1]
+        old_dir = old.get("QQQ", 0) if old.get("QQQ", 0) == old.get("SPY", 0) else 0
+        if not flips and old_dir == c["dir"]:
+            return
+        pct = {"QQQ": c["q"], "SPY": c["s"]}
+        L = ["🔄 تغيّر اتجاه QQQ / SPY", "━━━━━━━━━━━━━━"]
+        for n in ("QQQ", "SPY"):
+            if old.get(n, 0) != new[n]:
+                L.append(f"• {n}: {ctx_word(old.get(n, 0))} ← {ctx_word(new[n])} "
+                         f"({pct[n]:+.2f}%)")
+        if old_dir != c["dir"]:
+            L.append(f"الحالة العامة: {ctx_dir_text(old_dir)} ← {ctx_dir_text(c['dir'])}")
+        L += ["", f"🌐 QQQ {c['q']:+.2f}% | SPY {c['s']:+.2f}%", ctx_advice(c["dir"]),
+              f"🕒 {ns.now.strftime('%H:%M:%S')} نيويورك ({LOCAL_NAME} {hm(ns.now, LOCAL)})",
+              "ℹ️ تنبيه فقط ولا يلغي أي إشارة قائمة."]
+        self.q("\n".join(L))
+
     # ---- لقطة السوق ----
     def snapshot(self):
         now = datetime.now(NY)
@@ -696,6 +845,7 @@ class Bot:
         ns.atr1h = atr(hv.h1[-30:]) if hv.h1 else ns.atr5 * 3
         ns.vix, ns.vix_chg = hv.vix, hv.vix_chg
         ns.bias1h, ns.bias4h = htf_bias(hv.h1), htf_bias(hv.h4)
+        ns.ctx = self.market_ctx() if CTX_ENABLED else None
 
         ns.day_high = max(c.h for c in today)
         ns.day_low = min(c.l for c in today)
@@ -756,6 +906,11 @@ class Bot:
             f"السعر {ctrl_side} خط الكنترول ({f(ns.control)})",
             f"VIX: {vix_line}",
             f"الفريم الكبير: 1س {bias_text(ns.bias1h)} | 4س {bias_text(ns.bias4h)}",
+        ]
+        cb = self.ctx_block(ns, None)
+        if cb:
+            L += cb.strip().split("\n")
+        L += [
             "",
             "📏 نطاقات الحركة",
             f"المدى اليومي المعتاد (ADR): {f(ns.adr)} نقطة",
@@ -813,6 +968,7 @@ class Bot:
         ks = None
         if side != "NONE":
             ks = strike_levels(side, ns.price, pred, ns.atr5, minutes_left)
+        cside = side if side != "NONE" else None
 
         if minutes_left in CLOSE_SHORT:
             L = [
@@ -824,6 +980,9 @@ class Bot:
             ]
             if ks:
                 L += [""] + strike_lines(side, ns.price, ks)
+            cb = self.ctx_block(ns, cside, compact=True)
+            if cb:
+                L += ["", cb.strip()]
             L += ["", stamp(ns, ns.last_t, "آخر شمعة في البيانات", full=False),
                   "⚠️ تقدير إحصائي وليس نصيحة مالية."]
         else:
@@ -839,6 +998,9 @@ class Bot:
             ]
             if ks:
                 L += [""] + strike_lines(side, ns.price, ks)
+            cb = self.ctx_block(ns, cside)
+            if cb:
+                L += ["", cb.strip()]
             L += [
                 "",
                 stamp(ns, ns.last_t, "آخر شمعة في البيانات"),
@@ -876,6 +1038,7 @@ class Bot:
             self.fvg_seen.clear(); self.cross_seen.clear()
             self.rb_seen.clear(); self.rb_boxes.clear(); self.preds.clear()
             self.sigma_seen.clear(); self.sigmas.clear()
+            self.orb_seen.clear(); self.ctx_sign.clear()
             self.trades.clear(); self.fired.clear(); self.last_signal.clear()
             self.outbox.clear()
 
@@ -884,12 +1047,17 @@ class Bot:
         live = now.time() < CLOSE
 
         if live:
+            # 0) تغير اتجاه QQQ / SPY
+            self.check_ctx_change(ns)
+
             # 1) فجوة جديدة
             for z in ns.zones:
                 if z.kind.startswith("FVG") and z.t >= closed[-2].t and z.id not in self.fvg_seen:
                     self.fvg_seen.add(z.id)
+                    cb = self.ctx_block(ns, "CALL" if z.bullish else "PUT")
                     self.q(f"📦 تكوّنت {z.name}\nالنطاق: {f(z.lo)} – {f(z.hi)}\n"
-                           f"الفريم: 5 دقائق | السعر الآن: {f(ns.price)}\n"
+                           f"الفريم: 5 دقائق | السعر الآن: {f(ns.price)}"
+                           f"{cb}\n"
                            + stamp(ns, z.t, "شمعة تكوّن الفجوة"))
 
             # 2) اقتراب السعر من أوردربلوك
@@ -900,8 +1068,10 @@ class Bot:
                 if near and z.t < k.t:
                     self.touched.add(z.id)
                     side = "شراء 🟢" if z.bullish else "بيع 🔴"
+                    cb = self.ctx_block(ns, "CALL" if z.bullish else "PUT")
                     self.q(f"🧱 السعر عند منطقة {z.name} ({side})\n"
-                           f"النطاق: {f(z.lo)} – {f(z.hi)}\nالسعر الآن: {f(ns.price)}\n"
+                           f"النطاق: {f(z.lo)} – {f(z.hi)}\nالسعر الآن: {f(ns.price)}"
+                           f"{cb}\n"
                            + stamp(ns, ns.last_t, "آخر شمعة في البيانات"))
 
             # 3) اختراق خط الكنترول (إغلاق شمعة)
@@ -914,9 +1084,11 @@ class Bot:
                 key = tc[-1].t
                 if (up or dn) and key not in self.cross_seen:
                     self.cross_seen.add(key)
+                    cb = self.ctx_block(ns, "CALL" if up else "PUT")
                     self.q(("⚡ إغلاق شمعة فوق خط الكنترول — انحياز صاعد 🟢\n" if up else
                             "⚡ إغلاق شمعة تحت خط الكنترول — انحياز هابط 🔴\n")
-                           + f"الكنترول: {f(cs_)} | الإغلاق: {f(tc[-1].c)}\n"
+                           + f"الكنترول: {f(cs_)} | الإغلاق: {f(tc[-1].c)}"
+                           + f"{cb}\n"
                            + stamp(ns, tc[-1].t, "شمعة الاختراق"))
 
             # 4) Rejection Block (شمعة رفض + شمعة تأكيد)
@@ -925,6 +1097,10 @@ class Bot:
             # 4-ب) إشارة Σ سيغما (شمعة رفض 5 دقائق عند إغلاقها)
             if SIGMA_ENABLED:
                 self.check_sigma(ns)
+
+            # 4-ج) اختراق الشمعة الأولى (9:30-9:35)
+            if ORB_ENABLED:
+                self.check_orb(ns)
 
         # 5) متابعة الصناديق (إعادة اختبار / إلغاء) والصفقات المفتوحة
         self.rb_lifecycle(ns)
@@ -947,12 +1123,12 @@ class Bot:
 
     # ---- الصفقات ----
     def add_trade(self, side, kind, score, entry, sl, tp1, tp2, t, ref, box=None,
-                  htf=0, sweep=False):
+                  htf=0, sweep=False, mkt=None):
         self.count += 1
         tr = {"side": side, "kind": kind, "score": score, "entry": entry,
               "sl": sl, "sl0": sl, "risk": abs(entry - sl) or 1.0,
               "tp1": tp1, "tp2": tp2, "from": t, "ref": ref, "box": box,
-              "htf": int(htf), "sweep": bool(sweep),
+              "htf": int(htf), "sweep": bool(sweep), "mkt": mkt,
               "tp1_hit": False, "done": False, "warned": False}
         self.trades.append(tr)
         return tr
@@ -963,12 +1139,14 @@ class Bot:
         long = tr["side"] == "CALL"
         r = (exit_price - tr["entry"]) / tr["risk"] * (1 if long else -1)
         tr["r"] = round(r, 2)
+        mk = tr.get("mkt")
         csv_append(TRADES_CSV, TRADE_HEADER, [
             tr["from"].strftime("%Y-%m-%d"), tr["from"].strftime("%H:%M"),
             t.astimezone(NY).strftime("%H:%M"), tr["side"], tr["kind"], tr["score"],
             f"{tr['entry']:.2f}", f"{tr['sl0']:.2f}", f"{tr['tp1']:.2f}",
             f"{tr['tp2']:.2f}", f"{exit_price:.2f}", result, f"{r:.2f}",
-            MODEL_VER, tr.get("htf", 0), "1" if tr.get("sweep") else "0"])
+            MODEL_VER, tr.get("htf", 0), "1" if tr.get("sweep") else "0",
+            "" if mk is None else mk])
 
     def check_rb(self, ns):
         """إشارة Rejection Block: شمعة رفض (ذيل طويل عند قاع/قمة محلية)
@@ -1012,7 +1190,8 @@ class Bot:
             htf_v = ns.bias1h if up else -ns.bias1h
             self.add_trade(tside, "RB", score, entry, sl, tp1, tp2, conf.t,
                            ref=bot if up else top, box=key,
-                           htf=htf_v, sweep=bool(sw))
+                           htf=htf_v, sweep=bool(sw),
+                           mkt=self.mkt_align(ns, tside))
 
             rng = rej.h - rej.l
             if up:
@@ -1034,6 +1213,7 @@ class Bot:
                        "الفريم الكبير محايد")
             sweep_txt = (f"💧 سبقه سحب سيولة ({sw[0]} عند {f(sw[1])})" if sw
                          else "💧 بدون سحب سيولة")
+            cb = self.ctx_block(ns, tside)
             self.q(
                 f"{title}\n━━━━━━━━━━━━━━\n"
                 f"⭐ الدرجة: {strength(score)} ({score}/4)\n"
@@ -1049,9 +1229,81 @@ class Bot:
                 f"الهدف الأول 1R: {f(tp1)}\n"
                 f"الهدف الثاني 2R: {f(tp2)}\n"
                 f"{htf_txt}\n"
-                f"السعر الآن: {f(ns.price)}\n\n"
+                f"السعر الآن: {f(ns.price)}"
+                f"{cb}\n\n"
                 f"{stamp(ns, rej.t, 'شمعة الرفض', full=False)}\n"
                 f"{stamp(ns, conf.t, 'شمعة التأكيد')}\n\n"
+                "⚠️ إشارة آلية للمساعدة وليست نصيحة مالية؛ التزم بإدارة المخاطر."
+            )
+
+    # ---- إشارة اختراق الشمعة الأولى (Opening Range Breakout) ----
+    def check_orb(self, ns):
+        """الشمعة الأولى 9:30-9:35 تحدد القمة والقاع.
+        أول شمعة 5 دقائق تُغلق فوق القمة = إشارة CALL، وأول إغلاق تحت القاع = إشارة PUT.
+        مرة واحدة لكل اتجاه في اليوم. الوقف خلف الجهة المقابلة للشمعة الأولى
+        (بحدود 0.5 – 1.2 ATR) والأهداف 1R و 2R مثل باقي الإشارات."""
+        first = next((c for c in ns.today if c.t.time() == OPEN), None)
+        if first is None or first.t + timedelta(minutes=5) > ns.now:
+            return                      # الشمعة الأولى لم تُغلق بعد
+        hi, lo = first.h, first.l
+        a = ns.atr5
+        cs = ns.closed
+        for c in cs[-2:]:               # آخر شمعتين مغلقتين فقط (لتفادي الإشارات القديمة)
+            if c.t.date() != ns.now.date() or c.t <= first.t or not (OPEN <= c.t.time() < CLOSE):
+                continue
+            if c.c > hi:
+                side = "CALL"
+            elif c.c < lo:
+                side = "PUT"
+            else:
+                continue
+            key = f"ORB-{side}"
+            if key in self.orb_seen:
+                continue
+            self.orb_seen.add(key)
+            long = side == "CALL"
+            # لو سبق هذه الشمعة إغلاق خارج النطاق بنفس الجهة فهذا ليس أول اختراق
+            if any(first.t < x.t < c.t and ((x.c > hi) if long else (x.c < lo)) for x in cs):
+                continue
+
+            entry = c.c
+            if long:
+                sl = lo - OB_STOP_ATR * a
+                sl = min(sl, entry - OB_MIN_RISK_ATR * a)
+                sl = max(sl, entry - OB_MAX_RISK_ATR * a)
+                ref = hi
+            else:
+                sl = hi + OB_STOP_ATR * a
+                sl = max(sl, entry + OB_MIN_RISK_ATR * a)
+                sl = min(sl, entry + OB_MAX_RISK_ATR * a)
+                ref = lo
+            risk = abs(entry - sl)
+            sgn = 1 if long else -1
+            tp1, tp2 = entry + sgn * risk, entry + sgn * 2 * risk
+            score, fl = self.confluence(ns, entry, entry, long)
+            htf = ns.bias1h if long else -ns.bias1h
+            self.add_trade(side, "ORB", score, entry, sl, tp1, tp2, c.t, ref=ref,
+                           htf=htf, sweep=False, mkt=self.mkt_align(ns, side))
+
+            htf_txt = ("متوافق مع الفريم الكبير ✅" if htf > 0 else
+                       "عكس الفريم الكبير ⚠️" if htf < 0 else
+                       "الفريم الكبير محايد")
+            emoji = "🟢" if long else "🔴"
+            cb = self.ctx_block(ns, side)
+            self.q(
+                f"🚀 اختراق الشمعة الأولى — {side} {emoji}\n━━━━━━━━━━━━━━\n"
+                f"⭐ الدرجة: {strength(score)} ({score}/4)\n"
+                f"{flags_text(fl)}\n\n"
+                f"الشمعة الأولى: قمة {f(hi)} | قاع {f(lo)} (مدى {f(hi - lo)})\n"
+                f"السبب: إغلاق شمعة 5 دقائق {'فوق القمة' if long else 'تحت القاع'} "
+                f"عند {f(c.c)}\n\n"
+                f"سعر الدخول: {f(entry)}\nوقف الخسارة: {f(sl)}\n"
+                f"الهدف الأول TP1 (1R): {f(tp1)}\nالهدف الثاني TP2 (2R): {f(tp2)}\n"
+                f"{htf_txt}\n"
+                f"السعر الآن: {f(ns.price)}"
+                f"{cb}\n\n"
+                f"{stamp(ns, first.t, 'الشمعة الأولى', full=False)}\n"
+                f"{stamp(ns, c.t, 'شمعة الاختراق')}\n\n"
                 "⚠️ إشارة آلية للمساعدة وليست نصيحة مالية؛ التزم بإدارة المخاطر."
             )
 
@@ -1127,6 +1379,7 @@ class Bot:
             sweep_txt = (f"💧 سحب سيولة ({sw[0]} عند {f(sw[1])})" if sw
                          else "💧 بدون سحب سيولة")
             ext = f"{'قاع' if up else 'قمة'} الذيل: {f(rej.l if up else rej.h)}"
+            cb = self.ctx_block(ns, "CALL" if up else "PUT")
             self.q(
                 f"Σ سيغما {side_ar} {emoji} — {prob}% — خلال {lo}-{hi} د — "
                 f"متوقع {exp:g}$\n━━━━━━━━━━━━━━\n"
@@ -1138,7 +1391,8 @@ class Bot:
                 f"{sweep_txt}\n"
                 f"التقاطعات: {flags_text(fl)}\n"
                 f"{htf_txt}\n"
-                f"السعر الآن: {f(ns.price)}\n\n"
+                f"السعر الآن: {f(ns.price)}"
+                f"{cb}\n\n"
                 f"{stamp(ns, rej.t, 'شمعة Σ')}\n\n"
                 "⚠️ الاحتمال تقدير مبني على جودة الشمعة والتقاطعات وليس نسبة مثبتة؛ "
                 "قارنه بنتائج /stats مع الوقت. وليست نصيحة مالية."
@@ -1242,13 +1496,14 @@ class Bot:
                         "UP" if long else "DOWN")
         htf = ns.bias1h if long else -ns.bias1h
         self.add_trade(side, z.kind, score, entry, sl, tp1, tp2, k.t, ref=ref,
-                       htf=htf, sweep=bool(sw))
+                       htf=htf, sweep=bool(sw), mkt=self.mkt_align(ns, side))
         htf_txt = ("متوافقة مع الفريم الكبير ✅" if htf > 0 else
                    "عكس الفريم الكبير ⚠️ (صفقة ارتداد)" if htf < 0 else
                    "الفريم الكبير محايد")
         sweep_txt = (f"💧 سحب سيولة ({sw[0]} عند {f(sw[1])})" if sw
                      else "💧 بدون سحب سيولة")
         emoji = "🟢" if long else "🔴"
+        cb = self.ctx_block(ns, side)
         self.q(
             f"🚨 إشارة {side} {emoji}\n━━━━━━━━━━━━━━\n"
             f"⭐ الدرجة: {strength(score)} ({score}/4)\n"
@@ -1257,7 +1512,8 @@ class Bot:
             f"السبب: ارتداد من {z.name} ({f(z.lo)} – {f(z.hi)}) مع إغلاق شمعة مؤكد\n"
             f"سعر الدخول: {f(entry)}\nوقف الخسارة: {f(sl)}\n"
             f"الهدف الأول TP1 (1R): {f(tp1)}\nالهدف الثاني TP2 (2R): {f(tp2)}\n"
-            f"{htf_txt}\n\n"
+            f"{htf_txt}"
+            f"{cb}\n\n"
             f"{stamp(ns, k.t, 'شمعة التأكيد')}\n"
             f"🧱 {z.name} على شمعة: {hm(z.t)} نيويورك\n"
             f"💱 السعر الآن: {f(ns.price)} ({ns.price - entry:+.2f} عن سعر الدخول)\n\n"
@@ -1462,6 +1718,12 @@ class Bot:
                 sa = [t for t in new_t if t.get("sweep") == "1"]
                 sb = [t for t in new_t if t.get("sweep") == "0"]
                 L.append(f"سحب السيولة: معه {_fmt_tally(sa)} | بدونه {_fmt_tally(sb)}")
+                ma = [t for t in new_t if t.get("mkt") == "1"]
+                mb = [t for t in new_t if t.get("mkt") == "-1"]
+                mn = [t for t in new_t if t.get("mkt") == "0"]
+                if ma or mb or mn:
+                    L.append(f"QQQ/SPY: معه {_fmt_tally(ma)} | عكسه {_fmt_tally(mb)} "
+                             f"| محايد {_fmt_tally(mn)}")
                 L.append("الرموز: ✅ هدف ثانٍ | ↩️ تعادل | ❌ وقف")
             else:
                 L += ["", "🔹 لا توجد صفقات بالنظام الجديد بعد."]
